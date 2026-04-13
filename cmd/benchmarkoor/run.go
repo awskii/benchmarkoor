@@ -77,10 +77,35 @@ func runBenchmark(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("parsing results_owner: %w", err)
 	}
 
+	// Ensure configured temporary directories exist.
+	if dir := cfg.Runner.Directories.TmpDataDir; dir != "" {
+		if err := fsutil.MkdirAll(dir, 0755, resultsOwner); err != nil {
+			return fmt.Errorf("creating tmp_datadir %q: %w", dir, err)
+		}
+	}
+
+	if dir := cfg.Runner.Directories.TmpCacheDir; dir != "" {
+		if err := fsutil.MkdirAll(dir, 0755, resultsOwner); err != nil {
+			return fmt.Errorf("creating tmp_cachedir %q: %w", dir, err)
+		}
+	}
+
 	// Use consistent log format when client logs go to stdout.
 	if cfg.Runner.ClientLogsToStdout {
 		log.SetFormatter(&consistentFormatter{prefix: "🔵"})
 	}
+
+	// Buffer all log entries to a temp file so they can be replayed into each
+	// instance's benchmarkoor.log, capturing logs from before RunInstance.
+	// Created after the formatter is set so the buffered output matches the
+	// per-instance log format.
+	preRunLogBuffer, err := runner.NewBufferHook(log.Formatter, cfg.Runner.Directories.TmpCacheDir)
+	if err != nil {
+		return fmt.Errorf("creating pre-run log buffer: %w", err)
+	}
+	defer preRunLogBuffer.Close()
+
+	log.AddHook(preRunLogBuffer)
 
 	// Setup context with signal handling.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -298,7 +323,7 @@ func runBenchmark(cmd *cobra.Command, args []string) error {
 			FullConfig:         cfg,
 		}
 
-		r := runner.NewRunner(log, runnerCfg, containerMgr, registry, exec, cpufreqMgr, resultsUploader)
+		r := runner.NewRunner(log, runnerCfg, containerMgr, registry, exec, cpufreqMgr, resultsUploader, preRunLogBuffer)
 
 		if err := r.Start(ctx); err != nil {
 			return fmt.Errorf("starting runner: %w", err)
