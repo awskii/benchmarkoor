@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries } from '@tanstack/react-query'
 import clsx from 'clsx'
 import { Check, Copy, Download } from 'lucide-react'
@@ -110,6 +110,11 @@ interface TestHeatmapProps {
   threshold?: number
   stepFilter?: StepTypeOption[]
   postTestRPCCalls?: PostTestRPCCallConfig[]
+  // inProgressTestKey, when set, marks one tile to pulse blue
+  // continuously — used by the live view to show "the runner is
+  // working on this test right now". Caller (LiveRunDetailView) picks
+  // the lowest-order un-processed tile while status === 'running'.
+  inProgressTestKey?: string
   onSelectedTestChange?: (testName: string | undefined) => void
   onSortModeChange?: (mode: SortMode) => void
   onGroupModeChange?: (mode: GroupMode) => void
@@ -174,12 +179,24 @@ interface TestData {
   gasUsedTimeTotal: number
   hasFail: boolean
   noData: boolean
+  // notProcessed is true when the test is part of the suite but no
+  // result entry exists for it yet (live run still in progress, run
+  // canceled, etc). Distinct from noData (test ran but produced no gas
+  // data) so the cell can show a more faded "didn't run" style.
+  notProcessed: boolean
 }
 
-// Diagonal stripe pattern for tests without data
+// Diagonal stripe pattern for tests that ran but didn't produce gas data
+// (e.g. failed at setup before the test step).
 const NO_DATA_STYLE = {
   backgroundColor: '#374151',
   backgroundImage: 'repeating-linear-gradient(45deg, transparent, transparent 2px, #1f2937 2px, #1f2937 4px)',
+}
+
+// Faded style for tests that exist in the suite but haven't been
+// processed yet (in-progress live runs, canceled runs, etc).
+const NOT_PROCESSED_STYLE = {
+  backgroundColor: 'rgba(156, 163, 175, 0.15)',
 }
 
 function PostTestDumps({ runId, testName, calls }: { runId: string; testName: string; calls: PostTestRPCCallConfig[] }) {
@@ -250,6 +267,8 @@ function HeatmapCell({
   threshold,
   statusFilter,
   searchQuery,
+  popDelayMs,
+  isInProgress,
   onSelect,
   onMouseEnter,
   onMouseLeave,
@@ -258,18 +277,52 @@ function HeatmapCell({
   threshold: number
   statusFilter: TestStatusFilter
   searchQuery: string
+  // popDelayMs is set when this tile just transitioned from
+  // not-processed to having a result, driving a brief scale + brightness
+  // flash. Undefined means no animation (steady state). The delay is
+  // staggered across newly-completed tiles so they pop one after another.
+  popDelayMs?: number
+  // isInProgress turns on an infinite blue pulse for the tile that
+  // represents the test the runner is most likely currently executing.
+  // Pop animation takes precedence when both are set (a tile transitions
+  // from "in progress" to "completed" on the next snapshot).
+  isInProgress?: boolean
   onSelect: (testKey: string) => void
   onMouseEnter: (test: TestData, event: React.MouseEvent) => void
   onMouseLeave: () => void
 }) {
   const matchesStatusFilter =
     statusFilter === 'all' ||
-    (statusFilter === 'passed' && !test.hasFail) ||
-    (statusFilter === 'failed' && test.hasFail)
+    // Not-processed tiles are neither "passed" nor "failed" — exclude
+    // them from those filters so the user can isolate ran-and-passed /
+    // ran-and-failed tests cleanly.
+    (!test.notProcessed && statusFilter === 'passed' && !test.hasFail) ||
+    (!test.notProcessed && statusFilter === 'failed' && test.hasFail)
   const matchesSearchQuery = !searchQuery || test.testKey.toLowerCase().includes(searchQuery.toLowerCase())
   const matchesFilter = matchesStatusFilter && matchesSearchQuery
-  const baseStyle = test.noData ? NO_DATA_STYLE : { backgroundColor: getColorByThreshold(test.mgasPerSec, threshold) }
-  const style = matchesFilter ? baseStyle : { ...baseStyle, opacity: 0.2 }
+  let baseStyle: React.CSSProperties
+  if (test.notProcessed) {
+    baseStyle = NOT_PROCESSED_STYLE
+  } else if (test.noData) {
+    baseStyle = NO_DATA_STYLE
+  } else {
+    baseStyle = { backgroundColor: getColorByThreshold(test.mgasPerSec, threshold) }
+  }
+  const style: React.CSSProperties = {
+    ...baseStyle,
+    transition: 'background-color 0.4s ease-out',
+    ...(matchesFilter ? {} : { opacity: 0.2 }),
+  }
+
+  // Animation precedence: a freshly-popping tile takes priority over
+  // the "in progress" pulse, since it represents the in-progress tile
+  // transitioning into a completed one on the latest snapshot.
+  if (popDelayMs !== undefined) {
+    style.animation = 'heatmapPop 0.6s ease-out both'
+    style.animationDelay = `${popDelayMs}ms`
+  } else if (isInProgress) {
+    style.animation = 'liveTilePulse 1.2s ease-in-out infinite'
+  }
 
   return (
     <button
@@ -299,6 +352,7 @@ export function TestHeatmap({
   threshold: thresholdProp,
   stepFilter = ALL_STEP_TYPES,
   postTestRPCCalls,
+  inProgressTestKey,
   onSelectedTestChange,
   onSortModeChange,
   onGroupModeChange,
@@ -311,6 +365,13 @@ export function TestHeatmap({
   const [opcodeSort, setOpcodeSort] = useState<OpcodeSortMode>('name')
   const [activeStepTab, setActiveStepTab] = useState<'test' | 'setup' | 'cleanup'>('test')
   const { data: blockLogs } = useBlockLogs(runId)
+
+  // Pop-in stagger state for newly-completed tiles. Populated below by
+  // an effect that diffs the latest testData against the previous
+  // completed set; declared up here so it's in scope when we render the
+  // cell list further down.
+  const prevCompletedRef = useRef<Set<string> | null>(null)
+  const [popDelays, setPopDelays] = useState<Map<string, number>>(new Map())
 
   const handleSortModeChange = (mode: SortMode) => {
     onSortModeChange?.(mode)
@@ -345,13 +406,42 @@ export function TestHeatmap({
     let minMgas = Infinity
     let maxMgas = -Infinity
 
-    for (const [testName, entry] of Object.entries(tests)) {
+    // Union of suite tests and tests with results, so the heatmap always
+    // shows a tile for every planned test in the suite — even if the run
+    // hasn't reached it yet (live), got canceled before it ran, or only
+    // a subset ran. Tests in `tests` but missing from `suiteTests`
+    // (shouldn't normally happen) are still included so we don't lose data.
+    const allTestNames = new Set<string>(Object.keys(tests))
+    if (suiteTests) {
+      for (const t of suiteTests) allTestNames.add(t.name)
+    }
+
+    for (const testName of allTestNames) {
+      const entry = tests[testName]
+      const order = executionOrder.get(testName) ?? Infinity
+
+      if (!entry) {
+        // Suite test with no result → tile for visual completeness only.
+        data.push({
+          testKey: testName,
+          filename: testName,
+          order,
+          mgasPerSec: 0,
+          gasUsedTotal: 0,
+          gasUsedTimeTotal: 0,
+          hasFail: false,
+          noData: true,
+          notProcessed: true,
+        })
+
+        continue
+      }
+
       // Use stepFilter for MGas/s calculation
       const statsFiltered = getAggregatedStats(entry, stepFilter)
       // Use all steps for hasFail indicator
       const statsAll = getAggregatedStats(entry, ALL_STEP_TYPES)
       const mgasPerSec = statsFiltered ? calculateMGasPerSec(statsFiltered.gas_used_total, statsFiltered.gas_used_time_total) : undefined
-      const order = executionOrder.get(testName) ?? Infinity
       const noData = mgasPerSec === undefined
 
       if (!noData) {
@@ -368,6 +458,7 @@ export function TestHeatmap({
         gasUsedTimeTotal: statsFiltered?.gas_used_time_total ?? 0,
         hasFail: statsAll ? statsAll.fail > 0 : false,
         noData,
+        notProcessed: false,
       })
     }
 
@@ -375,7 +466,59 @@ export function TestHeatmap({
     if (maxMgas === -Infinity) maxMgas = 0
 
     return { testData: data, minMgas, maxMgas }
-  }, [tests, executionOrder, stepFilter])
+  }, [tests, suiteTests, executionOrder, stepFilter])
+
+  // Animate tiles that just transitioned from "not processed" to having
+  // a result by giving each one a staggered pop-in. We diff against the
+  // set of completed keys from the previous render — kept in a ref —
+  // and assign each newly-completed tile a delay so they cascade in
+  // execution order. The first render seeds the ref without animating
+  // anything (avoids flashing every existing tile on initial paint).
+  useEffect(() => {
+    const completed = new Set<string>()
+    const ordered: { key: string; order: number }[] = []
+    for (const t of testData) {
+      if (!t.notProcessed) {
+        completed.add(t.testKey)
+        ordered.push({ key: t.testKey, order: t.order })
+      }
+    }
+
+    if (prevCompletedRef.current === null) {
+      prevCompletedRef.current = completed
+
+      return
+    }
+
+    const newly = ordered
+      .filter(({ key }) => !prevCompletedRef.current!.has(key))
+      .sort((a, b) => a.order - b.order)
+    prevCompletedRef.current = completed
+
+    if (newly.length === 0) return
+
+    // Stagger 60ms per tile, capped so a huge burst still finishes
+    // within ~2s. Tiles past the cap all start at the cap delay.
+    const stepMs = 60
+    const maxStaggerMs = 1800
+    const map = new Map<string, number>()
+    for (let i = 0; i < newly.length; i++) {
+      map.set(newly[i].key, Math.min(i * stepMs, maxStaggerMs))
+    }
+
+    // Intentional cascading render: this is a one-shot animation
+    // signal derived from a diff against the previous render's state,
+    // not steady-state derived data. Each testData change emits exactly
+    // two follow-up renders (set delays, then clear them after the
+    // pop), bounded and small.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPopDelays(map)
+
+    const longest = Math.min((newly.length - 1) * stepMs, maxStaggerMs) + 600 + 100
+    const t = setTimeout(() => setPopDelays(new Map()), longest)
+
+    return () => clearTimeout(t)
+  }, [testData])
 
   const sortedData = useMemo(() => {
     const sorted = [...testData]
@@ -577,7 +720,13 @@ export function TestHeatmap({
           </div>
         </div>
         <div className="text-xs/5 text-gray-500 dark:text-gray-400">
-          {testData.length} tests | {minMgas.toFixed(1)} - {maxMgas.toFixed(1)} MGas/s
+          {(() => {
+            const notProcessed = testData.filter((t) => t.notProcessed).length
+            if (notProcessed > 0) {
+              return `${testData.length - notProcessed}/${testData.length} tests processed | ${minMgas.toFixed(1)} - ${maxMgas.toFixed(1)} MGas/s`
+            }
+            return `${testData.length} tests | ${minMgas.toFixed(1)} - ${maxMgas.toFixed(1)} MGas/s`
+          })()}
         </div>
       </div>
 
@@ -603,6 +752,8 @@ export function TestHeatmap({
                       threshold={threshold}
                       statusFilter={statusFilter}
                       searchQuery={searchQuery}
+                      popDelayMs={popDelays.get(test.testKey)}
+                      isInProgress={test.testKey === inProgressTestKey}
                       onSelect={handleSelect}
                       onMouseEnter={handleMouseEnter}
                       onMouseLeave={handleMouseLeave}
@@ -621,6 +772,8 @@ export function TestHeatmap({
                 threshold={threshold}
                 statusFilter={statusFilter}
                 searchQuery={searchQuery}
+                popDelayMs={popDelays.get(test.testKey)}
+                isInProgress={test.testKey === inProgressTestKey}
                 onSelect={handleSelect}
                 onMouseEnter={handleMouseEnter}
                 onMouseLeave={handleMouseLeave}
@@ -691,6 +844,10 @@ export function TestHeatmap({
           No data
         </span>
         <span>
+          <span className="mr-1 inline-block size-3 rounded-xs ring-1 ring-gray-300 dark:ring-gray-700" style={NOT_PROCESSED_STYLE} />
+          Not processed
+        </span>
+        <span>
           <span className="mr-1 inline-block size-3 rounded-xs ring-1 ring-red-500" style={{ backgroundColor: COLORS[2] }} />
           Has failures
         </span>
@@ -711,7 +868,14 @@ export function TestHeatmap({
             {genesisMap.get(tooltip.test.testKey) && (
               <div className="text-gray-500 dark:text-gray-400">Genesis: {genesisMap.get(tooltip.test.testKey)}</div>
             )}
-            <div>MGas/s: {tooltip.test.noData ? 'No data' : tooltip.test.mgasPerSec.toFixed(2)}</div>
+            <div>
+              MGas/s:{' '}
+              {tooltip.test.notProcessed
+                ? 'Not processed yet'
+                : tooltip.test.noData
+                  ? 'No data'
+                  : tooltip.test.mgasPerSec.toFixed(2)}
+            </div>
             {!tooltip.test.noData && (
               <>
                 <div>Gas used: {(tooltip.test.gasUsedTotal / 1_000_000).toFixed(2)} MGas</div>
@@ -720,9 +884,18 @@ export function TestHeatmap({
             )}
             <div className="text-gray-500 dark:text-gray-400">Based on steps: {stepFilter.join(', ')}</div>
             <div className="w-48 break-all text-gray-500 dark:text-gray-400">{tooltip.test.filename}</div>
-            {tooltip.test.noData && <div className="text-gray-500 dark:text-gray-400">No gas usage data available</div>}
+            {tooltip.test.notProcessed ? (
+              <div className="text-gray-500 dark:text-gray-400">Test was not run</div>
+            ) : tooltip.test.noData ? (
+              <div className="text-gray-500 dark:text-gray-400">No gas usage data available</div>
+            ) : null}
             {tooltip.test.hasFail && <div className="text-red-600 dark:text-red-400">Has failures</div>}
-            <div className="mt-1 text-gray-400 dark:text-gray-500">Click for details</div>
+            {/* Only hint at clicking when the parent actually wired a
+                handler — the live view doesn't, since there are no
+                per-test details to open while the run is in progress. */}
+            {onSelectedTestChange && (
+              <div className="mt-1 text-gray-400 dark:text-gray-500">Click for details</div>
+            )}
           </div>
         </div>
       )}
