@@ -9,6 +9,7 @@ import { MetadataLabels } from '@/components/run-detail/MetadataLabels'
 import { GitHubSection } from '@/components/run-detail/GitHubSection'
 import { ClientRunsStrip } from '@/components/run-detail/ClientRunsStrip'
 import { TestHeatmap, type SortMode, type GroupMode } from '@/components/run-detail/TestHeatmap'
+import { LiveRunLogPanel } from '@/components/run-detail/LiveRunLogPanel'
 import { useSuite } from '@/api/hooks/useSuite'
 import { useIndex } from '@/api/hooks/useIndex'
 import { formatTimestamp } from '@/utils/date'
@@ -277,6 +278,14 @@ export function LiveRunDetailView({ run }: LiveRunDetailViewProps) {
         />
       )}
 
+      {/* Live log stream — collapsed by default; opening the panel is
+          what signals the runner to start pushing log bytes. */}
+      <LiveRunLogPanel
+        runId={run.run_id}
+        client={clientName || undefined}
+        instanceId={instanceID || undefined}
+      />
+
       {/* Live Performance Heatmap — fed by the per-test gas data the
           runner ships in every snapshot. Renders as soon as we have
           either suite info (un-processed tiles) or completed tests. */}
@@ -285,7 +294,7 @@ export function LiveRunDetailView({ run }: LiveRunDetailViewProps) {
           <div className="mb-4 flex items-center justify-between">
             <h3 className="flex items-center gap-2 text-sm/6 font-medium text-gray-900 dark:text-gray-100">
               <Flame className="size-4 text-gray-400 dark:text-gray-500" />
-              Performance Heatmap (Live)
+              Performance Heatmap
             </h3>
           </div>
           <TestHeatmap
