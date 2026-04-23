@@ -1,31 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ReactECharts from 'echarts-for-react'
-import { Flame } from 'lucide-react'
-import type { RunResult, SuiteTest, AggregatedStats } from '@/api/types'
-import { type StepTypeOption, getAggregatedStats } from '@/pages/RunDetailPage'
+import { Activity } from 'lucide-react'
+import type { RunResult, SuiteTest } from '@/api/types'
 import { type ChartType, type CompareRun, type LabelMode, RUN_SLOTS, formatRunLabel } from './constants'
+import type { ZoomRange } from './MGasComparisonChart'
 import { useChartAreaClick } from './useChartAreaClick'
 
-export interface ZoomRange {
-  start: number
-  end: number
-}
-
-interface MGasComparisonChartProps {
+interface CVComparisonChartProps {
   runs: CompareRun[]
   suiteTests?: SuiteTest[]
-  stepFilter: StepTypeOption[]
   labelMode: LabelMode
   testNameFilter?: (name: string) => boolean
   zoomRange?: ZoomRange
   onZoomChange?: (range: ZoomRange) => void
   chartType?: ChartType
+  /** Per-run variance keyed by CompareRun.index. */
+  varianceByRunIndex: Map<number, Record<string, { mgasStddev: number; mgasMean: number }>>
   onTestClick?: (testName: string) => void
-}
-
-function calculateMGasPerSec(stats: AggregatedStats | undefined): number | undefined {
-  if (!stats || stats.gas_used_time_total <= 0 || stats.gas_used_total <= 0) return undefined
-  return (stats.gas_used_total * 1000) / stats.gas_used_time_total
 }
 
 function useDarkMode() {
@@ -42,43 +33,46 @@ function useDarkMode() {
   return isDark
 }
 
-interface MGasDataPoint {
+interface CVDataPoint {
   testIndex: number
   testOrder: number
   testName: string
-  mgas: number
+  cv: number
 }
 
-function buildMGasData(
+function buildCVData(
   result: RunResult,
   suiteTests: SuiteTest[] | undefined,
-  stepFilter: StepTypeOption[],
+  variance: Record<string, { mgasStddev: number; mgasMean: number }> | undefined,
   nameFilter?: (name: string) => boolean,
-): MGasDataPoint[] {
+): CVDataPoint[] {
+  if (!variance) return []
+
   const suiteOrder = new Map<string, number>()
   if (suiteTests) {
     suiteTests.forEach((t, i) => suiteOrder.set(t.name, i + 1))
   }
 
-  const entries: { name: string; order: number; mgas: number }[] = []
+  const entries: { name: string; order: number; cv: number }[] = []
   for (const [name, entry] of Object.entries(result.tests)) {
     if (nameFilter && !nameFilter(name)) continue
-    const stats = getAggregatedStats(entry, stepFilter)
-    const mgas = calculateMGasPerSec(stats)
-    if (mgas === undefined) continue
+    const v = variance[name]
+    if (!v || v.mgasMean <= 0) continue
+    const cv = (v.mgasStddev / v.mgasMean) * 100
     const order = suiteOrder.get(name) ?? (parseInt(entry.dir, 10) || 0)
-    entries.push({ name, order, mgas })
+    entries.push({ name, order, cv })
   }
 
   entries.sort((a, b) => a.order - b.order)
-  return entries.map((e, i) => ({ testIndex: i + 1, testOrder: e.order, testName: e.name, mgas: e.mgas }))
+  return entries.map((e, i) => ({ testIndex: i + 1, testOrder: e.order, testName: e.name, cv: e.cv }))
 }
 
-export function MGasComparisonChart({ runs, suiteTests, stepFilter, labelMode, testNameFilter, zoomRange: externalZoom, onZoomChange, chartType = 'line', onTestClick }: MGasComparisonChartProps) {
+export function CVComparisonChart({ runs, suiteTests, labelMode, testNameFilter, zoomRange: externalZoom, onZoomChange, chartType = 'line', varianceByRunIndex, onTestClick }: CVComparisonChartProps) {
   const isDark = useDarkMode()
   const [internalZoom, setInternalZoom] = useState({ start: 0, end: 100 })
   const zoomRange = externalZoom ?? internalZoom
   const prevZoomRef = useRef(zoomRange)
+  const [threshold, setThreshold] = useState(20)
 
   const handleZoom = useCallback((params: { start?: number; end?: number; batch?: Array<{ start: number; end: number }> }) => {
     let start: number | undefined
@@ -101,8 +95,8 @@ export function MGasComparisonChart({ runs, suiteTests, stepFilter, labelMode, t
   const onEvents = useMemo(() => ({ datazoom: handleZoom }), [handleZoom])
 
   const pointsPerRun = useMemo(
-    () => runs.map((r) => r.result ? buildMGasData(r.result, suiteTests, stepFilter, testNameFilter) : []),
-    [runs, suiteTests, stepFilter, testNameFilter],
+    () => runs.map((r) => r.result ? buildCVData(r.result, suiteTests, varianceByRunIndex.get(r.index), testNameFilter) : []),
+    [runs, suiteTests, varianceByRunIndex, testNameFilter],
   )
 
   const { highlightedTestRef, handleMouseDown, handleClick, cursor } = useChartAreaClick(onTestClick)
@@ -112,7 +106,6 @@ export function MGasComparisonChart({ runs, suiteTests, stepFilter, labelMode, t
     const axisLineColor = isDark ? '#4b5563' : '#d1d5db'
     const splitLineColor = isDark ? '#374151' : '#e5e7eb'
     const maxLen = Math.max(...pointsPerRun.map((p) => p.length))
-    // Build a map from sequential index to original test order for axis labels
     const indexToOrder = new Map<number, number>()
     for (const points of pointsPerRun) {
       for (const d of points) {
@@ -153,7 +146,7 @@ export function MGasComparisonChart({ runs, suiteTests, stepFilter, labelMode, t
             const value = p.value[1]
             const client = clientBySeriesName.get(p.seriesName)
             const clientImg = client ? `<img src="/img/clients/${client}.jpg" style="display:inline-block;width:14px;height:14px;border-radius:50%;object-fit:cover;vertical-align:middle;margin-right:4px;" />` : ''
-            content += `${clientImg}<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background-color:${p.color};margin-right:6px;vertical-align:middle;"></span>${p.seriesName}: ${value.toFixed(2)} MGas/s<br/>`
+            content += `${clientImg}<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background-color:${p.color};margin-right:6px;vertical-align:middle;"></span>${p.seriesName}: ${value.toFixed(2)}%<br/>`
           })
           return content
         },
@@ -177,12 +170,12 @@ export function MGasComparisonChart({ runs, suiteTests, stepFilter, labelMode, t
         axisLabel: {
           color: textColor,
           fontSize: 11,
-          formatter: (value: number) => `${value.toFixed(0)}`,
+          formatter: (value: number) => `${value.toFixed(1)}%`,
         },
         axisLine: { show: true, lineStyle: { color: axisLineColor } },
         axisTick: { show: true, lineStyle: { color: axisLineColor } },
         splitLine: { lineStyle: { color: splitLineColor } },
-        name: 'MGas/s',
+        name: 'CV (%)',
         nameTextStyle: { color: textColor, fontSize: 11 },
       },
       legend: {
@@ -218,12 +211,32 @@ export function MGasComparisonChart({ runs, suiteTests, stepFilter, labelMode, t
       series: runs.map((_run, i) => {
         const slot = RUN_SLOTS[i]
         const points = pointsPerRun[i]
-        const data = points.map((d) => [d.testIndex, d.mgas, d.testName, d.testOrder])
+        const data = points.map((d) => [d.testIndex, d.cv, d.testName, d.testOrder])
+        const markLine = i === 0
+          ? {
+              silent: true,
+              symbol: 'none' as const,
+              lineStyle: {
+                color: isDark ? '#ef4444' : '#dc2626',
+                type: 'dashed' as const,
+                width: 1.5,
+              },
+              label: {
+                show: true,
+                position: 'insideEndTop' as const,
+                formatter: `${threshold}%`,
+                color: isDark ? '#fca5a5' : '#b91c1c',
+                fontSize: 10,
+              },
+              data: [{ yAxis: threshold }],
+            }
+          : undefined
         const base = {
           name: `Run ${formatRunLabel(slot, runs[i], labelMode)}`,
           data,
           itemStyle: { color: slot.color },
           cursor: onTestClick ? 'pointer' : 'default',
+          ...(markLine ? { markLine } : {}),
         }
         if (chartType === 'bar') {
           return { ...base, type: 'bar' as const, barMaxWidth: 6 }
@@ -242,18 +255,36 @@ export function MGasComparisonChart({ runs, suiteTests, stepFilter, labelMode, t
         }
       }),
     }
-  }, [pointsPerRun, runs, isDark, zoomRange, labelMode, chartType, onTestClick, highlightedTestRef])
+  }, [pointsPerRun, runs, isDark, zoomRange, labelMode, chartType, threshold, onTestClick, highlightedTestRef])
 
   if (pointsPerRun.every((p) => p.length === 0)) return null
 
   return (
     <div className="rounded-sm bg-white p-4 shadow-xs dark:bg-gray-800">
-      <div className="mb-2 flex items-center justify-between">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2">
-          <Flame className="size-4 text-gray-400 dark:text-gray-500" />
-          <h3 className="text-sm/6 font-medium text-gray-900 dark:text-gray-100">MGas/s per Test</h3>
+          <Activity className="size-4 text-gray-400 dark:text-gray-500" />
+          <h3
+            className="text-sm/6 font-medium text-gray-900 dark:text-gray-100"
+            title="Coefficient of Variation — standard deviation of MGas/s as a percentage of the mean, across the sampled runs in each group. Lower = more consistent."
+          >
+            Coefficient of Variation per Test (MGas/s)
+          </h3>
         </div>
-        <div className="flex items-center gap-2 text-xs/5">
+        <div className="flex flex-wrap items-center gap-3 text-xs/5">
+          <label className="flex items-center gap-1.5 text-gray-500 dark:text-gray-400">
+            <span>Threshold:</span>
+            <input
+              type="range"
+              min={0}
+              max={50}
+              step={1}
+              value={threshold}
+              onChange={(e) => setThreshold(Number(e.target.value))}
+              className="w-24 accent-red-600 dark:accent-red-500"
+            />
+            <span className="w-8 font-mono tabular-nums text-gray-700 dark:text-gray-300">{threshold}%</span>
+          </label>
           {runs.map((run) => {
             const slot = RUN_SLOTS[run.index]
             return (
@@ -273,6 +304,64 @@ export function MGasComparisonChart({ runs, suiteTests, stepFilter, labelMode, t
           onEvents={onEvents}
           notMerge
         />
+      </div>
+      <div className="mt-3 border-t border-gray-200 pt-3 dark:border-gray-700">
+        <table className="w-full text-xs/5">
+          <thead>
+            <tr className="text-gray-500 dark:text-gray-400">
+              <th className="pb-1 text-left font-medium">Run</th>
+              <th className="pb-1 text-right font-medium" title={`Tests with CV ≤ ${threshold}%`}>Below</th>
+              <th className="pb-1 text-right font-medium">Avg</th>
+              <th className="pb-1 text-right font-medium">P95</th>
+              <th className="pb-1 pr-3 text-right font-medium">Max</th>
+              <th className="border-l border-gray-200 pb-1 pl-3 text-right font-medium dark:border-gray-600" title={`Tests with CV > ${threshold}%`}>Above</th>
+              <th className="pb-1 text-right font-medium">Avg</th>
+              <th className="pb-1 text-right font-medium">P95</th>
+              <th className="pb-1 pr-3 text-right font-medium">Max</th>
+              <th className="border-l border-gray-200 pb-1 pl-3 text-right font-medium dark:border-gray-600">Total</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100 dark:divide-gray-700/50">
+            {runs.map((run, i) => {
+              const slot = RUN_SLOTS[run.index]
+              const points = pointsPerRun[i]
+              const below: number[] = []
+              const above: number[] = []
+              for (const p of points) {
+                if (p.cv > threshold) above.push(p.cv)
+                else below.push(p.cv)
+              }
+              const total = below.length + above.length
+              const avg = (arr: number[]) => arr.length > 0 ? arr.reduce((a, b) => a + b, 0) / arr.length : 0
+              const percentile = (arr: number[], p: number) => {
+                if (arr.length === 0) return 0
+                const sorted = [...arr].sort((a, b) => a - b)
+                const idx = Math.ceil((p / 100) * sorted.length) - 1
+                return sorted[Math.max(0, idx)]
+              }
+              const max = (arr: number[]) => arr.length > 0 ? Math.max(...arr) : 0
+              return (
+                <tr key={slot.label}>
+                  <td className="py-1">
+                    <span className="inline-flex items-center gap-1.5 font-medium" style={{ color: slot.color }}>
+                      <img src={`/img/clients/${run.config.instance.client}.jpg`} alt={run.config.instance.client} className="size-3.5 rounded-full object-cover" />
+                      {formatRunLabel(slot, run, labelMode)}
+                    </span>
+                  </td>
+                  <td className="py-1 text-right font-medium text-green-600 dark:text-green-400">{below.length}</td>
+                  <td className="py-1 text-right text-green-600 dark:text-green-400">{below.length > 0 ? `${avg(below).toFixed(1)}%` : '-'}</td>
+                  <td className="py-1 text-right text-green-600 dark:text-green-400">{below.length > 0 ? `${percentile(below, 95).toFixed(1)}%` : '-'}</td>
+                  <td className="py-1 pr-3 text-right text-green-600 dark:text-green-400">{below.length > 0 ? `${max(below).toFixed(1)}%` : '-'}</td>
+                  <td className="border-l border-gray-200 py-1 pl-3 text-right font-medium text-red-600 dark:border-gray-600 dark:text-red-400">{above.length}</td>
+                  <td className="py-1 text-right text-red-600 dark:text-red-400">{above.length > 0 ? `${avg(above).toFixed(1)}%` : '-'}</td>
+                  <td className="py-1 text-right text-red-600 dark:text-red-400">{above.length > 0 ? `${percentile(above, 95).toFixed(1)}%` : '-'}</td>
+                  <td className="py-1 pr-3 text-right text-red-600 dark:text-red-400">{above.length > 0 ? `${max(above).toFixed(1)}%` : '-'}</td>
+                  <td className="border-l border-gray-200 py-1 pl-3 text-right text-gray-500 dark:border-gray-600 dark:text-gray-400">{total}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   )
