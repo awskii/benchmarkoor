@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ethpandaops/benchmarkoor/pkg/client"
 	"github.com/ethpandaops/benchmarkoor/pkg/config"
@@ -27,6 +28,8 @@ var (
 	limitInstanceIDs     []string
 	limitInstanceClients []string
 	metadataLabels       []string
+	stopAfterPrerun      bool
+	preRunStepSleep      time.Duration
 )
 
 var runCmd = &cobra.Command{
@@ -44,6 +47,12 @@ func init() {
 		"Limit to instances with these client types (comma-separated or repeated flag)")
 	runCmd.Flags().StringSliceVar(&metadataLabels, "metadata.label", nil,
 		"Add metadata label as key=value (can be repeated)")
+	runCmd.Flags().BoolVar(&stopAfterPrerun, "debug.stop-after-prerun", false,
+		"Exit after pre-run setup for each instance (RPC ready, bootstrap FCU done) "+
+			"without running tests. Leaves containers and data directories intact.")
+	runCmd.Flags().DurationVar(&preRunStepSleep, "debug.prerun-step-sleep", 0,
+		"Sleep between each RPC call within pre-run step files (e.g. 10ms, 1s). "+
+			"Default 0 disables sleeping.")
 }
 
 func runBenchmark(cmd *cobra.Command, args []string) error {
@@ -322,6 +331,8 @@ func runBenchmark(cmd *cobra.Command, args []string) error {
 			TmpCacheDir:        cfg.Runner.Directories.TmpCacheDir,
 			TestFilter:         cfg.Runner.Benchmark.Tests.Filter,
 			FullConfig:         cfg,
+			StopAfterPrerun:    stopAfterPrerun,
+			PreRunStepSleep:    preRunStepSleep,
 		}
 
 		r := runner.NewRunner(log, runnerCfg, containerMgr, registry, exec, cpufreqMgr, resultsUploader, preRunLogBuffer)
