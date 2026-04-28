@@ -259,6 +259,11 @@ export interface CheckpointRestoreStrategyOptions {
   restart_container?: boolean
 }
 
+export interface WarmupTestPayloadConfig {
+  enabled: boolean
+  fork?: string
+}
+
 export interface InstanceConfig {
   id: string
   client: string
@@ -284,6 +289,7 @@ export interface InstanceConfig {
   post_test_rpc_calls?: PostTestRPCCallConfig[]
   post_test_sleep_duration?: string
   checkpoint_restore_strategy_options?: CheckpointRestoreStrategyOptions
+  warmup_test_payload?: WarmupTestPayloadConfig
 }
 
 // result.json per run

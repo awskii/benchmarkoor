@@ -2673,3 +2673,118 @@ func TestValidateRunTimeout(t *testing.T) {
 		})
 	}
 }
+
+func TestGetWarmupTestPayload(t *testing.T) {
+	tests := []struct {
+		name     string
+		global   *WarmupTestPayloadConfig
+		instance *WarmupTestPayloadConfig
+		expected *WarmupTestPayloadConfig
+	}{
+		{
+			name:     "both nil returns nil",
+			global:   nil,
+			instance: nil,
+			expected: nil,
+		},
+		{
+			name:     "global set, instance nil inherits",
+			global:   &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka"},
+			instance: nil,
+			expected: &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka"},
+		},
+		{
+			name:     "instance overrides global",
+			global:   &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka"},
+			instance: &WarmupTestPayloadConfig{Enabled: false},
+			expected: &WarmupTestPayloadConfig{Enabled: false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Runner: RunnerConfig{
+					Client: ClientConfig{
+						Config: ClientDefaults{
+							WarmupTestPayload: tt.global,
+						},
+					},
+				},
+			}
+			instance := &ClientInstance{
+				WarmupTestPayload: tt.instance,
+			}
+			result := cfg.GetWarmupTestPayload(instance)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestValidateWarmupTestPayload(t *testing.T) {
+	tests := []struct {
+		name      string
+		global    *WarmupTestPayloadConfig
+		instance  *WarmupTestPayloadConfig
+		wantErr   bool
+		errSubstr string
+	}{
+		{
+			name:    "disabled is always valid",
+			global:  &WarmupTestPayloadConfig{Enabled: false, Fork: "prague"},
+			wantErr: false,
+		},
+		{
+			name:    "enabled with osaka",
+			global:  &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka"},
+			wantErr: false,
+		},
+		{
+			name:      "enabled with empty fork",
+			global:    &WarmupTestPayloadConfig{Enabled: true, Fork: ""},
+			wantErr:   true,
+			errSubstr: `warmup_test_payload.fork must be "osaka"`,
+		},
+		{
+			name:      "enabled with unsupported fork",
+			global:    &WarmupTestPayloadConfig{Enabled: true, Fork: "prague"},
+			wantErr:   true,
+			errSubstr: `warmup_test_payload.fork must be "osaka"`,
+		},
+		{
+			name:      "instance enabled with bad fork overrides valid global",
+			global:    &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka"},
+			instance:  &WarmupTestPayloadConfig{Enabled: true, Fork: "shanghai"},
+			wantErr:   true,
+			errSubstr: `warmup_test_payload.fork must be "osaka"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Runner: RunnerConfig{
+					Client: ClientConfig{
+						Config: ClientDefaults{
+							WarmupTestPayload: tt.global,
+						},
+					},
+					Instances: []ClientInstance{
+						{
+							ID:                "test",
+							Client:            "geth",
+							WarmupTestPayload: tt.instance,
+						},
+					},
+				},
+			}
+			err := cfg.validateWarmupTestPayload()
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errSubstr)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}

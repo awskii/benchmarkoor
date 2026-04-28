@@ -40,6 +40,7 @@ export function ConfigDiff({ runs, labelMode }: ConfigDiffProps) {
       inst.image !== first.image
       || inst.client !== first.client
       || inst.rollback_strategy !== first.rollback_strategy
+      || JSON.stringify(inst.warmup_test_payload) !== JSON.stringify(first.warmup_test_payload)
       || JSON.stringify(inst.command) !== JSON.stringify(first.command)
       || JSON.stringify(inst.environment) !== JSON.stringify(first.environment),
     ) || systems.some((sys) =>
@@ -108,6 +109,16 @@ export function ConfigDiff({ runs, labelMode }: ConfigDiffProps) {
               )}
               {instances.some((i) => i.rollback_strategy) && (
                 <DiffRow label="Rollback Strategy" values={instances.map((i) => i.rollback_strategy ?? 'none')} />
+              )}
+              {instances.some((i) => i.warmup_test_payload) && (
+                <DiffRow
+                  label="Warmup Test Payload"
+                  values={instances.map((i) => {
+                    const w = i.warmup_test_payload
+                    if (!w || !w.enabled) return 'disabled'
+                    return w.fork ? `enabled (${w.fork})` : 'enabled'
+                  })}
+                />
               )}
               {instances.some((i) => i.environment) && (
                 <DiffRow

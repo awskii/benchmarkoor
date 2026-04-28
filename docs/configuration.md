@@ -656,6 +656,7 @@ runner:
 | `post_test_rpc_calls` | []object | - | Arbitrary RPC calls to execute after each test step (see [Post-Test RPC Calls](#post-test-rpc-calls)) |
 | `post_test_sleep_duration` | string | - | Sleep duration after each test, e.g. `200ms`, `1s` (see below) |
 | `bootstrap_fcu` | bool/object | - | Send an `engine_forkchoiceUpdatedV3` after RPC is ready to confirm the client is fully synced (see [Bootstrap FCU](#bootstrap-fcu)) |
+| `warmup_test_payload` | object | - | Insert a warmup phase between setup and test that sends modified `engine_newPayload*` calls (stateRoot replaced, blockHash recomputed) to warm caches (see [Warmup Test Payload](#warmup-test-payload)) |
 | `genesis` | map | - | Genesis file URLs keyed by client type |
 
 ##### Drop Memory Caches
@@ -917,6 +918,30 @@ When using the `container-recreate` rollback strategy, the bootstrap FCU is sent
 - When starting from pre-populated data directories where the client needs time to validate state before processing Engine API requests
 - When you observe test failures due to the client returning errors or SYNCING responses on the first Engine API calls
 
+##### Warmup Test Payload
+
+The `warmup_test_payload` option inserts a warmup phase between the setup and test steps. For each `engine_newPayload*` call in the test step, the runner creates a copy with the `stateRoot` replaced by a fork-specific placeholder and the `blockHash` recomputed to match. These warmup payloads are sent to the client before the real test runs. The client is expected to reject them with a state-root mismatch — the value is in the work the client performs (cache fills, codepath warming) before that rejection.
+
+```yaml
+runner:
+  client:
+    config:
+      warmup_test_payload:
+        enabled: true
+        fork: osaka
+```
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `enabled` | bool | Yes | `false` | Enable the warmup phase |
+| `fork` | string | Yes | - | Fork used to compute the warmup `blockHash`. Only `osaka` is currently supported |
+
+Warmup steps reuse the test step's lines as the source. Non-`engine_newPayload*` lines pass through unchanged. Warmup results are written to `<test>/warmup.{response,result-details.json,result-aggregated.json}` alongside the existing setup/test/cleanup outputs.
+
+**When to use:**
+- When you want to measure the client's "hot" performance and the existing setup phase doesn't fully populate caches
+- When investigating cold-start regressions by comparing warmup-on vs warmup-off runs
+
 #### Data Directories
 
 The `runner.client.datadirs` section configures pre-populated data directories per client type. When configured, the init container is skipped and data is mounted directly.
@@ -949,6 +974,7 @@ runner:
 | `overlayfs` | Linux overlayfs for near-instant setup | Root access |
 | `fuse-overlayfs` | FUSE-based overlayfs | `fuse-overlayfs` package; `user_allow_other` in `/etc/fuse.conf` if Docker runs as root. **Warning:** ~3x slower than native overlayfs |
 | `zfs` | ZFS snapshots and clones for copy-on-write setup | Source directory on ZFS filesystem; root access or ZFS delegations configured |
+| `direct` | Bind-mount `source_dir` as-is, no copy/snapshot/clone. Container writes persist after the run. **Not suitable for normal benchmarking** — intended for inspection or resume workflows (e.g. pointing at a ZFS clone left behind by `--debug.stop-after-prerun`) | None |
 
 ###### ZFS Setup
 
@@ -1024,6 +1050,7 @@ runner:
 | `post_test_rpc_calls` | []object | No | From `runner.client.config` | Instance-specific post-test RPC calls (replaces global) |
 | `post_test_sleep_duration` | string | No | From `runner.client.config` | Instance-specific post-test sleep duration |
 | `bootstrap_fcu` | bool/object | No | From `runner.client.config` | Instance-specific bootstrap FCU setting |
+| `warmup_test_payload` | object | No | From `runner.client.config` | Instance-specific warmup test payload setting (replaces global) |
 
 ## Resource Limits
 

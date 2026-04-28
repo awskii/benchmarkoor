@@ -508,6 +508,18 @@ type BootstrapFCUConfig struct {
 	HeadBlockHash string `yaml:"head_block_hash" mapstructure:"head_block_hash" json:"head_block_hash,omitempty"`
 }
 
+// WarmupTestPayloadConfig configures the warmup phase that runs between
+// setup and test steps. When enabled, the runner takes the test step's
+// engine_newPayload* calls, replaces stateRoot with a fork-specific
+// placeholder, and recomputes blockHash before sending the resulting
+// payloads to the client. The expected outcome is a fast state-root
+// rejection by the client; the value of doing this is that caches and
+// codepaths get warmed up before the real test runs.
+type WarmupTestPayloadConfig struct {
+	Enabled bool   `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
+	Fork    string `yaml:"fork" mapstructure:"fork" json:"fork,omitempty"`
+}
+
 // PostTestRPCCall defines an arbitrary RPC call to execute after the test step.
 type PostTestRPCCall struct {
 	Method  string     `yaml:"method" mapstructure:"method" json:"method"`
@@ -729,6 +741,7 @@ type ClientDefaults struct {
 	PostTestSleepDuration            string                            `yaml:"post_test_sleep_duration,omitempty" mapstructure:"post_test_sleep_duration"`
 	BootstrapFCU                     *BootstrapFCUConfig               `yaml:"bootstrap_fcu,omitempty" mapstructure:"bootstrap_fcu"`
 	CheckpointRestoreStrategyOptions *CheckpointRestoreStrategyOptions `yaml:"checkpoint_restore_strategy_options,omitempty" mapstructure:"checkpoint_restore_strategy_options"`
+	WarmupTestPayload                *WarmupTestPayloadConfig          `yaml:"warmup_test_payload,omitempty" mapstructure:"warmup_test_payload"`
 	Metadata                         MetadataConfig                    `yaml:"metadata,omitempty" mapstructure:"metadata"`
 }
 
@@ -755,6 +768,7 @@ type ClientInstance struct {
 	PostTestSleepDuration            string                            `yaml:"post_test_sleep_duration,omitempty" mapstructure:"post_test_sleep_duration"`
 	BootstrapFCU                     *BootstrapFCUConfig               `yaml:"bootstrap_fcu,omitempty" mapstructure:"bootstrap_fcu"`
 	CheckpointRestoreStrategyOptions *CheckpointRestoreStrategyOptions `yaml:"checkpoint_restore_strategy_options,omitempty" mapstructure:"checkpoint_restore_strategy_options"`
+	WarmupTestPayload                *WarmupTestPayloadConfig          `yaml:"warmup_test_payload,omitempty" mapstructure:"warmup_test_payload"`
 	Metadata                         MetadataConfig                    `yaml:"metadata,omitempty" mapstructure:"metadata"`
 }
 
@@ -1197,6 +1211,11 @@ func (c *Config) Validate(opts ...ValidateOpts) error {
 		return err
 	}
 
+	// Validate warmup_test_payload settings.
+	if err := c.validateWarmupTestPayload(); err != nil {
+		return err
+	}
+
 	// Validate results_upload settings.
 	if err := c.validateResultsUpload(); err != nil {
 		return err
@@ -1611,6 +1630,17 @@ func (c *Config) GetCheckpointRestoreStrategyOptions(
 	}
 
 	return c.Runner.Client.Config.CheckpointRestoreStrategyOptions
+}
+
+// GetWarmupTestPayload returns the warmup_test_payload config for an instance.
+// Instance-level config (when non-nil) fully replaces the global default.
+// Returns nil if not configured at either level.
+func (c *Config) GetWarmupTestPayload(instance *ClientInstance) *WarmupTestPayloadConfig {
+	if instance.WarmupTestPayload != nil {
+		return instance.WarmupTestPayload
+	}
+
+	return c.Runner.Client.Config.WarmupTestPayload
 }
 
 // GetCheckpointTmpfsThreshold returns the tmpfs_threshold for an instance.
@@ -2081,6 +2111,26 @@ func (c *Config) validateBootstrapFCU() error {
 						" 32-byte hex string, got %q", instance.ID, cfg.HeadBlockHash,
 				)
 			}
+		}
+	}
+
+	return nil
+}
+
+// validateWarmupTestPayload validates warmup_test_payload settings.
+// Currently only "osaka" is a supported fork.
+func (c *Config) validateWarmupTestPayload() error {
+	for _, instance := range c.Runner.Instances {
+		cfg := c.GetWarmupTestPayload(&instance)
+		if cfg == nil || !cfg.Enabled {
+			continue
+		}
+
+		if cfg.Fork != "osaka" {
+			return fmt.Errorf(
+				"instance %q: warmup_test_payload.fork must be \"osaka\" (got %q)",
+				instance.ID, cfg.Fork,
+			)
 		}
 	}
 

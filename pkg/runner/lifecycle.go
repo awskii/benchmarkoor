@@ -625,6 +625,12 @@ func (r *runner) runContainerLifecycle(
 				}
 				return nil
 			}(),
+			WarmupTestPayload: func() *config.WarmupTestPayloadConfig {
+				if r.cfg.FullConfig != nil {
+					return r.cfg.FullConfig.GetWarmupTestPayload(instance)
+				}
+				return nil
+			}(),
 		},
 	}
 
@@ -1124,6 +1130,7 @@ func (r *runner) runContainerLifecycle(
 				PostTestSleepDuration:         r.cfg.FullConfig.GetPostTestSleepDuration(instance),
 				PreRunStepSleep:               r.cfg.PreRunStepSleep,
 				SkipUntilBlockNumber:          blockNum,
+				WarmupTestPayload:             r.cfg.FullConfig.GetWarmupTestPayload(instance),
 			}
 
 			result, execErr = r.executor.ExecuteTests(execCtx, execOpts)
