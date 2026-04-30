@@ -41,6 +41,8 @@ export function ConfigDiff({ runs, labelMode }: ConfigDiffProps) {
       || inst.client !== first.client
       || inst.rollback_strategy !== first.rollback_strategy
       || JSON.stringify(inst.warmup_test_payload) !== JSON.stringify(first.warmup_test_payload)
+      || JSON.stringify(inst.retry_new_payloads_syncing_state) !== JSON.stringify(first.retry_new_payloads_syncing_state)
+      || JSON.stringify(inst.retry_new_payloads_failed_state) !== JSON.stringify(first.retry_new_payloads_failed_state)
       || JSON.stringify(inst.command) !== JSON.stringify(first.command)
       || JSON.stringify(inst.environment) !== JSON.stringify(first.environment),
     ) || systems.some((sys) =>
@@ -117,6 +119,26 @@ export function ConfigDiff({ runs, labelMode }: ConfigDiffProps) {
                     const w = i.warmup_test_payload
                     if (!w || !w.enabled) return 'disabled'
                     return w.fork ? `enabled (${w.fork})` : 'enabled'
+                  })}
+                />
+              )}
+              {instances.some((i) => i.retry_new_payloads_syncing_state) && (
+                <DiffRow
+                  label="Retry on SYNCING"
+                  values={instances.map((i) => {
+                    const r = i.retry_new_payloads_syncing_state
+                    if (!r || !r.enabled) return 'disabled'
+                    return `enabled (max=${r.max_retries}, backoff=${r.backoff})`
+                  })}
+                />
+              )}
+              {instances.some((i) => i.retry_new_payloads_failed_state) && (
+                <DiffRow
+                  label="Retry on Failure"
+                  values={instances.map((i) => {
+                    const r = i.retry_new_payloads_failed_state
+                    if (!r || !r.enabled) return 'disabled'
+                    return `enabled (max=${r.max_retries}, backoff=${r.backoff})`
                   })}
                 />
               )}
