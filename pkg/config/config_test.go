@@ -2774,6 +2774,22 @@ func TestValidateWarmupTestPayload(t *testing.T) {
 			wantErr:   true,
 			errSubstr: "warmup_test_payload.count must be >= 1",
 		},
+		{
+			name:    "enabled with explicit invalid-stateroot method is valid",
+			global:  &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka", Method: "invalid-stateroot"},
+			wantErr: false,
+		},
+		{
+			name:    "enabled with empty method defaults (valid)",
+			global:  &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka", Method: ""},
+			wantErr: false,
+		},
+		{
+			name:      "enabled with unknown method is invalid",
+			global:    &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka", Method: "rewrite-everything"},
+			wantErr:   true,
+			errSubstr: `warmup_test_payload.method must be "invalid-stateroot"`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2820,6 +2836,24 @@ func TestWarmupTestPayloadConfig_EffectiveCount(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.expected, tt.cfg.EffectiveCount())
+		})
+	}
+}
+
+func TestWarmupTestPayloadConfig_EffectiveMethod(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      *WarmupTestPayloadConfig
+		expected string
+	}{
+		{name: "nil returns invalid-stateroot", cfg: nil, expected: "invalid-stateroot"},
+		{name: "empty returns invalid-stateroot", cfg: &WarmupTestPayloadConfig{Method: ""}, expected: "invalid-stateroot"},
+		{name: "explicit returns the value", cfg: &WarmupTestPayloadConfig{Method: "invalid-stateroot"}, expected: "invalid-stateroot"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.cfg.EffectiveMethod())
 		})
 	}
 }

@@ -519,23 +519,29 @@ type BootstrapFCUConfig struct {
 	HeadBlockHash string `yaml:"head_block_hash" mapstructure:"head_block_hash" json:"head_block_hash,omitempty"`
 }
 
+// WarmupMethodInvalidStateRoot is the only warmup method currently
+// supported. The runner takes each engine_newPayload* call from the test
+// step, replaces stateRoot with a deterministically-derived placeholder,
+// and recomputes blockHash. The client typically rejects the payload on
+// state-root mismatch, but the work it does first warms its caches.
+const WarmupMethodInvalidStateRoot = "invalid-stateroot"
+
 // WarmupTestPayloadConfig configures the warmup phase that runs between
-// setup and test steps. When enabled, the runner takes the test step's
-// engine_newPayload* calls, replaces stateRoot with a fork-specific
-// placeholder, and recomputes blockHash before sending the resulting
-// payloads to the client. The expected outcome is a fast state-root
-// rejection by the client; the value of doing this is that caches and
-// codepaths get warmed up before the real test runs.
+// setup and test steps. The behavior is determined by Method.
 //
 // Count controls how many times each engine_newPayload* line is sent. Each
 // iteration uses a different (deterministically derived) stateRoot so the
 // client treats the calls as distinct payloads. Default is 1; must be >= 1
 // when enabled. Non-newPayload lines (e.g. forkchoiceUpdated) are sent once
 // regardless of Count.
+//
+// Method selects the warmup strategy. Currently only "invalid-stateroot"
+// (the default) is supported.
 type WarmupTestPayloadConfig struct {
 	Enabled bool   `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
 	Fork    string `yaml:"fork" mapstructure:"fork" json:"fork,omitempty"`
 	Count   int    `yaml:"count,omitempty" mapstructure:"count" json:"count,omitempty"`
+	Method  string `yaml:"method,omitempty" mapstructure:"method" json:"method,omitempty"`
 }
 
 // EffectiveCount returns the number of warmup iterations per newPayload
@@ -546,6 +552,16 @@ func (c *WarmupTestPayloadConfig) EffectiveCount() int {
 	}
 
 	return c.Count
+}
+
+// EffectiveMethod returns the warmup method, defaulting to
+// WarmupMethodInvalidStateRoot when unset.
+func (c *WarmupTestPayloadConfig) EffectiveMethod() string {
+	if c == nil || c.Method == "" {
+		return WarmupMethodInvalidStateRoot
+	}
+
+	return c.Method
 }
 
 // PostTestRPCCall defines an arbitrary RPC call to execute after the test step.
@@ -2191,8 +2207,10 @@ func (c *Config) validateBootstrapFCU() error {
 }
 
 // validateWarmupTestPayload validates warmup_test_payload settings.
-// Currently only "osaka" is a supported fork. Count must be >= 1 when set;
-// an unset (zero) Count is treated as the default 1.
+// Currently only "osaka" is a supported fork and "invalid-stateroot" the
+// only supported method. Count must be >= 1 when set; an unset (zero)
+// Count is treated as the default 1. An unset Method defaults to
+// "invalid-stateroot".
 func (c *Config) validateWarmupTestPayload() error {
 	for _, instance := range c.Runner.Instances {
 		cfg := c.GetWarmupTestPayload(&instance)
@@ -2211,6 +2229,15 @@ func (c *Config) validateWarmupTestPayload() error {
 			return fmt.Errorf(
 				"instance %q: warmup_test_payload.count must be >= 1 when enabled (got %d)",
 				instance.ID, cfg.Count,
+			)
+		}
+
+		// Empty method is allowed (defaults to invalid-stateroot via
+		// EffectiveMethod). A non-empty method must be one we recognize.
+		if cfg.Method != "" && cfg.Method != WarmupMethodInvalidStateRoot {
+			return fmt.Errorf(
+				"instance %q: warmup_test_payload.method must be %q (got %q)",
+				instance.ID, WarmupMethodInvalidStateRoot, cfg.Method,
 			)
 		}
 	}

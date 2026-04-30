@@ -343,6 +343,10 @@ export function RunConfiguration({ instance, system, startBlock, metadata, bench
                         <span className="text-gray-500 dark:text-gray-400">enabled: </span>
                         true
                       </div>
+                      <div>
+                        <span className="text-gray-500 dark:text-gray-400">method: </span>
+                        {instance.warmup_test_payload.method || 'invalid-stateroot'}
+                      </div>
                       {instance.warmup_test_payload.fork && (
                         <div>
                           <span className="text-gray-500 dark:text-gray-400">fork: </span>

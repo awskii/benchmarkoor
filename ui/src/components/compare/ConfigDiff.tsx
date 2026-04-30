@@ -119,8 +119,9 @@ export function ConfigDiff({ runs, labelMode }: ConfigDiffProps) {
                     const w = i.warmup_test_payload
                     if (!w || !w.enabled) return 'disabled'
                     const count = w.count && w.count > 0 ? w.count : 1
-                    const parts = [`count=${count}`]
-                    if (w.fork) parts.unshift(w.fork)
+                    const method = w.method || 'invalid-stateroot'
+                    const parts = [`method=${method}`, `count=${count}`]
+                    if (w.fork) parts.splice(1, 0, w.fork)
                     return `enabled (${parts.join(', ')})`
                   })}
                 />

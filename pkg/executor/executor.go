@@ -791,7 +791,7 @@ writeResults:
 }
 
 // runWarmupStep generates warmup payloads from the given test step's
-// engine_newPayload* lines (stateRoot replaced, blockHash recomputed) and
+// engine_newPayload* lines (transformed per the configured method) and
 // runs them via runStepLines so the client populates caches before the
 // real test runs.
 func (e *executor) runWarmupStep(
@@ -800,25 +800,32 @@ func (e *executor) runWarmupStep(
 	testStep *StepFile,
 	result *TestResult,
 ) error {
-	gen, err := warmup.NewGenerator(
-		warmup.Fork(opts.WarmupTestPayload.Fork),
-		opts.WarmupTestPayload.EffectiveCount(),
-	)
-	if err != nil {
-		return fmt.Errorf("creating warmup generator: %w", err)
-	}
+	cfg := opts.WarmupTestPayload
 
-	lines, err := readStepLines(testStep)
-	if err != nil {
-		return fmt.Errorf("reading test step for warmup: %w", err)
-	}
+	switch method := cfg.EffectiveMethod(); method {
+	case config.WarmupMethodInvalidStateRoot:
+		gen, err := warmup.NewGenerator(
+			warmup.Fork(cfg.Fork),
+			cfg.EffectiveCount(),
+		)
+		if err != nil {
+			return fmt.Errorf("creating warmup generator: %w", err)
+		}
 
-	transformed, err := gen.TransformLines(lines)
-	if err != nil {
-		return fmt.Errorf("transforming warmup payloads: %w", err)
-	}
+		lines, err := readStepLines(testStep)
+		if err != nil {
+			return fmt.Errorf("reading test step for warmup: %w", err)
+		}
 
-	return e.runStepLines(ctx, opts, testStep.Name, transformed, result, false, 0)
+		transformed, err := gen.TransformLines(lines)
+		if err != nil {
+			return fmt.Errorf("transforming warmup payloads: %w", err)
+		}
+
+		return e.runStepLines(ctx, opts, testStep.Name, transformed, result, false, 0)
+	default:
+		return fmt.Errorf("unsupported warmup method %q", method)
+	}
 }
 
 // readStepLines returns the JSON-RPC lines from a step (file or provider).

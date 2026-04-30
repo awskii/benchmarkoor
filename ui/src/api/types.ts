@@ -269,6 +269,7 @@ export interface WarmupTestPayloadConfig {
   enabled: boolean
   fork?: string
   count?: number
+  method?: string
 }
 
 export interface InstanceConfig {
