@@ -2758,6 +2758,22 @@ func TestValidateWarmupTestPayload(t *testing.T) {
 			wantErr:   true,
 			errSubstr: `warmup_test_payload.fork must be "osaka"`,
 		},
+		{
+			name:    "enabled with explicit count is valid",
+			global:  &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka", Count: 3},
+			wantErr: false,
+		},
+		{
+			name:    "enabled with zero count defaults to 1 (valid)",
+			global:  &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka", Count: 0},
+			wantErr: false,
+		},
+		{
+			name:      "enabled with negative count is invalid",
+			global:    &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka", Count: -1},
+			wantErr:   true,
+			errSubstr: "warmup_test_payload.count must be >= 1",
+		},
 	}
 
 	for _, tt := range tests {
@@ -2785,6 +2801,25 @@ func TestValidateWarmupTestPayload(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+		})
+	}
+}
+
+func TestWarmupTestPayloadConfig_EffectiveCount(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      *WarmupTestPayloadConfig
+		expected int
+	}{
+		{name: "nil returns 1", cfg: nil, expected: 1},
+		{name: "zero returns 1", cfg: &WarmupTestPayloadConfig{Count: 0}, expected: 1},
+		{name: "negative returns 1", cfg: &WarmupTestPayloadConfig{Count: -5}, expected: 1},
+		{name: "positive returns value", cfg: &WarmupTestPayloadConfig{Count: 3}, expected: 3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, tt.cfg.EffectiveCount())
 		})
 	}
 }

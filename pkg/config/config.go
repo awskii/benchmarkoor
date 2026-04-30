@@ -526,9 +526,26 @@ type BootstrapFCUConfig struct {
 // payloads to the client. The expected outcome is a fast state-root
 // rejection by the client; the value of doing this is that caches and
 // codepaths get warmed up before the real test runs.
+//
+// Count controls how many times each engine_newPayload* line is sent. Each
+// iteration uses a different (deterministically derived) stateRoot so the
+// client treats the calls as distinct payloads. Default is 1; must be >= 1
+// when enabled. Non-newPayload lines (e.g. forkchoiceUpdated) are sent once
+// regardless of Count.
 type WarmupTestPayloadConfig struct {
 	Enabled bool   `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
 	Fork    string `yaml:"fork" mapstructure:"fork" json:"fork,omitempty"`
+	Count   int    `yaml:"count,omitempty" mapstructure:"count" json:"count,omitempty"`
+}
+
+// EffectiveCount returns the number of warmup iterations per newPayload
+// line. Treats unset/zero as 1.
+func (c *WarmupTestPayloadConfig) EffectiveCount() int {
+	if c == nil || c.Count <= 0 {
+		return 1
+	}
+
+	return c.Count
 }
 
 // PostTestRPCCall defines an arbitrary RPC call to execute after the test step.
@@ -2174,7 +2191,8 @@ func (c *Config) validateBootstrapFCU() error {
 }
 
 // validateWarmupTestPayload validates warmup_test_payload settings.
-// Currently only "osaka" is a supported fork.
+// Currently only "osaka" is a supported fork. Count must be >= 1 when set;
+// an unset (zero) Count is treated as the default 1.
 func (c *Config) validateWarmupTestPayload() error {
 	for _, instance := range c.Runner.Instances {
 		cfg := c.GetWarmupTestPayload(&instance)
@@ -2186,6 +2204,13 @@ func (c *Config) validateWarmupTestPayload() error {
 			return fmt.Errorf(
 				"instance %q: warmup_test_payload.fork must be \"osaka\" (got %q)",
 				instance.ID, cfg.Fork,
+			)
+		}
+
+		if cfg.Count < 0 {
+			return fmt.Errorf(
+				"instance %q: warmup_test_payload.count must be >= 1 when enabled (got %d)",
+				instance.ID, cfg.Count,
 			)
 		}
 	}

@@ -268,6 +268,7 @@ export interface CheckpointRestoreStrategyOptions {
 export interface WarmupTestPayloadConfig {
   enabled: boolean
   fork?: string
+  count?: number
 }
 
 export interface InstanceConfig {

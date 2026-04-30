@@ -949,7 +949,7 @@ When using the `container-recreate` rollback strategy, the bootstrap FCU is sent
 
 ##### Warmup Test Payload
 
-The `warmup_test_payload` option inserts a warmup phase between the setup and test steps. For each `engine_newPayload*` call in the test step, the runner creates a copy with the `stateRoot` replaced by a fork-specific placeholder and the `blockHash` recomputed to match. These warmup payloads are sent to the client before the real test runs. The client is expected to reject them with a state-root mismatch — the value is in the work the client performs (cache fills, codepath warming) before that rejection.
+The `warmup_test_payload` option inserts a warmup phase between the setup and test steps. For each `engine_newPayload*` call in the test step, the runner creates one or more copies with the `stateRoot` replaced by a fork-specific placeholder and the `blockHash` recomputed to match. These warmup payloads are sent to the client before the real test runs. The client is expected to reject them with a state-root mismatch — the value is in the work the client performs (cache fills, codepath warming) before that rejection.
 
 ```yaml
 runner:
@@ -958,12 +958,14 @@ runner:
       warmup_test_payload:
         enabled: true
         fork: osaka
+        count: 3
 ```
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `enabled` | bool | Yes | `false` | Enable the warmup phase |
 | `fork` | string | Yes | - | Fork used to compute the warmup `blockHash`. Only `osaka` is currently supported |
+| `count` | int | No | `1` | How many times each `engine_newPayload*` line is sent. Each iteration uses a different deterministic stateRoot (derived as `keccak256(salt ‖ uint64BE(i))`), so the client treats the calls as distinct payloads. Must be `>= 1` when enabled. Non-newPayload lines are sent once regardless |
 
 Warmup steps reuse the test step's lines as the source. Non-`engine_newPayload*` lines pass through unchanged. Warmup results are written to `<test>/warmup.{response,result-details.json,result-aggregated.json}` alongside the existing setup/test/cleanup outputs.
 

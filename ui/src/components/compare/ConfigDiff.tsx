@@ -118,7 +118,10 @@ export function ConfigDiff({ runs, labelMode }: ConfigDiffProps) {
                   values={instances.map((i) => {
                     const w = i.warmup_test_payload
                     if (!w || !w.enabled) return 'disabled'
-                    return w.fork ? `enabled (${w.fork})` : 'enabled'
+                    const count = w.count && w.count > 0 ? w.count : 1
+                    const parts = [`count=${count}`]
+                    if (w.fork) parts.unshift(w.fork)
+                    return `enabled (${parts.join(', ')})`
                   })}
                 />
               )}

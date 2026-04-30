@@ -349,11 +349,19 @@ export function RunConfiguration({ instance, system, startBlock, metadata, bench
                           {instance.warmup_test_payload.fork}
                         </div>
                       )}
+                      <div>
+                        <span className="text-gray-500 dark:text-gray-400">count: </span>
+                        {instance.warmup_test_payload.count && instance.warmup_test_payload.count > 0
+                          ? instance.warmup_test_payload.count
+                          : 1}
+                      </div>
                     </div>
                     <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
                       Inserts a warmup phase between setup and test that sends modified
                       engine_newPayload calls (stateRoot replaced, blockHash recomputed) to
-                      warm client caches before the real test runs.
+                      warm client caches before the real test runs. Each newPayload is sent
+                      <code className="mx-1 rounded bg-gray-200 px-1 dark:bg-gray-800">count</code>
+                      times with a different stateRoot per iteration.
                     </p>
                   </dd>
                 </div>

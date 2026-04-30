@@ -800,7 +800,10 @@ func (e *executor) runWarmupStep(
 	testStep *StepFile,
 	result *TestResult,
 ) error {
-	gen, err := warmup.NewGenerator(warmup.Fork(opts.WarmupTestPayload.Fork))
+	gen, err := warmup.NewGenerator(
+		warmup.Fork(opts.WarmupTestPayload.Fork),
+		opts.WarmupTestPayload.EffectiveCount(),
+	)
 	if err != nil {
 		return fmt.Errorf("creating warmup generator: %w", err)
 	}

@@ -50,33 +50,11 @@ func makeOsakaPayload(t *testing.T, stateRoot common.Hash) (engine.ExecutableDat
 	return data, block.Hash(), &beaconRoot
 }
 
-func TestNewGenerator_RejectsUnknownFork(t *testing.T) {
-	_, err := NewGenerator(Fork("prague"))
-	assert.Error(t, err)
-}
+// makeNewPayloadLine builds an engine_newPayloadV4 JSON-RPC envelope around
+// a self-consistent ExecutableData payload.
+func makeNewPayloadLine(t *testing.T, originalStateRoot common.Hash) (string, engine.ExecutableData, common.Hash, *common.Hash) {
+	t.Helper()
 
-func TestTransform_NonNewPayloadPassesThrough(t *testing.T) {
-	g, err := NewGenerator(ForkOsaka)
-	require.NoError(t, err)
-
-	in := `{"jsonrpc":"2.0","id":1,"method":"engine_forkchoiceUpdatedV3","params":[]}`
-
-	out, err := g.Transform(in)
-	require.NoError(t, err)
-	assert.Equal(t, in, out)
-}
-
-func TestTransform_EmptyLinePassesThrough(t *testing.T) {
-	g, err := NewGenerator(ForkOsaka)
-	require.NoError(t, err)
-
-	out, err := g.Transform("")
-	require.NoError(t, err)
-	assert.Equal(t, "", out)
-}
-
-func TestTransform_NewPayloadOverridesStateRootAndRecomputesHash(t *testing.T) {
-	originalStateRoot := common.HexToHash("0xde94bab83ce96d440db7a3e2dc95ebbab73dc5aa88dc80b3d99ae8f0cff4e96c")
 	data, originalHash, beaconRoot := makeOsakaPayload(t, originalStateRoot)
 
 	payloadJSON, err := json.Marshal(&data)
@@ -91,26 +69,90 @@ func TestTransform_NewPayloadOverridesStateRootAndRecomputesHash(t *testing.T) {
 	line := `{"jsonrpc":"2.0","id":1,"method":"engine_newPayloadV4","params":[` +
 		string(payloadJSON) + `,[],` + string(beaconRootJSON) + `,` + string(emptyRequests) + `]}`
 
-	g, err := NewGenerator(ForkOsaka)
+	return line, data, originalHash, beaconRoot
+}
+
+func TestNewGenerator_RejectsUnknownFork(t *testing.T) {
+	_, err := NewGenerator(Fork("prague"), 1)
+	assert.Error(t, err)
+}
+
+func TestNewGenerator_DefaultsZeroCountToOne(t *testing.T) {
+	g, err := NewGenerator(ForkOsaka, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 1, g.Count())
+}
+
+func TestNewGenerator_NegativeCountTreatedAsOne(t *testing.T) {
+	g, err := NewGenerator(ForkOsaka, -3)
+	require.NoError(t, err)
+	assert.Equal(t, 1, g.Count())
+}
+
+func TestStateRootForIteration_Deterministic(t *testing.T) {
+	g, err := NewGenerator(ForkOsaka, 1)
+	require.NoError(t, err)
+
+	// Same iteration → same hash.
+	assert.Equal(t, g.StateRootForIteration(0), g.StateRootForIteration(0))
+	assert.Equal(t, g.StateRootForIteration(7), g.StateRootForIteration(7))
+
+	// Different iterations → different hashes.
+	assert.NotEqual(t, g.StateRootForIteration(0), g.StateRootForIteration(1))
+	assert.NotEqual(t, g.StateRootForIteration(1), g.StateRootForIteration(2))
+
+	// Hashes are non-zero.
+	assert.NotEqual(t, common.Hash{}, g.StateRootForIteration(0))
+}
+
+func TestTransform_NonNewPayloadPassesThrough(t *testing.T) {
+	g, err := NewGenerator(ForkOsaka, 5) // count > 1 must NOT duplicate FCUs
+	require.NoError(t, err)
+
+	in := `{"jsonrpc":"2.0","id":1,"method":"engine_forkchoiceUpdatedV3","params":[]}`
+
+	out, err := g.Transform(in)
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	assert.Equal(t, in, out[0])
+}
+
+func TestTransform_EmptyLinePassesThrough(t *testing.T) {
+	g, err := NewGenerator(ForkOsaka, 1)
+	require.NoError(t, err)
+
+	out, err := g.Transform("")
+	require.NoError(t, err)
+	require.Len(t, out, 1)
+	assert.Equal(t, "", out[0])
+}
+
+func TestTransform_NewPayloadOverridesStateRootAndRecomputesHash(t *testing.T) {
+	originalStateRoot := common.HexToHash("0xde94bab83ce96d440db7a3e2dc95ebbab73dc5aa88dc80b3d99ae8f0cff4e96c")
+	line, _, originalHash, beaconRoot := makeNewPayloadLine(t, originalStateRoot)
+
+	g, err := NewGenerator(ForkOsaka, 1)
 	require.NoError(t, err)
 
 	out, err := g.Transform(line)
 	require.NoError(t, err)
+	require.Len(t, out, 1)
 
-	// Parse the transformed line back out.
+	// Parse the transformed line.
 	var parsed struct {
 		Method string            `json:"method"`
 		Params []json.RawMessage `json:"params"`
 	}
-	require.NoError(t, json.Unmarshal([]byte(out), &parsed))
+	require.NoError(t, json.Unmarshal([]byte(out[0]), &parsed))
 	assert.Equal(t, "engine_newPayloadV4", parsed.Method)
 	require.Len(t, parsed.Params, 4)
 
 	var transformed engine.ExecutableData
 	require.NoError(t, json.Unmarshal(parsed.Params[0], &transformed))
 
-	// stateRoot replaced with the warmup placeholder.
-	assert.Equal(t, common.HexToHash(OsakaWarmupStateRoot), transformed.StateRoot)
+	// stateRoot replaced with iteration-0 derived value.
+	assert.Equal(t, g.StateRootForIteration(0), transformed.StateRoot)
+	assert.NotEqual(t, originalStateRoot, transformed.StateRoot)
 
 	// blockHash changed.
 	assert.NotEqual(t, originalHash, transformed.BlockHash)
@@ -121,33 +163,87 @@ func TestTransform_NewPayloadOverridesStateRootAndRecomputesHash(t *testing.T) {
 	assert.Equal(t, expected.Hash(), transformed.BlockHash)
 }
 
-func TestTransformLines_PreservesOrderAndCount(t *testing.T) {
+func TestTransform_CountProducesDistinctVariants(t *testing.T) {
 	originalStateRoot := common.HexToHash("0xde94bab83ce96d440db7a3e2dc95ebbab73dc5aa88dc80b3d99ae8f0cff4e96c")
-	data, _, beaconRoot := makeOsakaPayload(t, originalStateRoot)
+	line, _, originalHash, beaconRoot := makeNewPayloadLine(t, originalStateRoot)
 
-	payloadJSON, err := json.Marshal(&data)
+	const count = 4
+
+	g, err := NewGenerator(ForkOsaka, count)
 	require.NoError(t, err)
 
-	beaconRootJSON, err := json.Marshal(beaconRoot)
+	out, err := g.Transform(line)
 	require.NoError(t, err)
+	require.Len(t, out, count)
 
-	emptyRequests, err := json.Marshal([]hexutil.Bytes{})
-	require.NoError(t, err)
+	seenStateRoots := make(map[common.Hash]struct{}, count)
+	seenBlockHashes := make(map[common.Hash]struct{}, count)
 
-	newPayload := `{"jsonrpc":"2.0","id":1,"method":"engine_newPayloadV4","params":[` +
-		string(payloadJSON) + `,[],` + string(beaconRootJSON) + `,` + string(emptyRequests) + `]}`
+	for i, variantLine := range out {
+		var parsed struct {
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(variantLine), &parsed))
+
+		var data engine.ExecutableData
+		require.NoError(t, json.Unmarshal(parsed.Params[0], &data))
+
+		// Each variant has the iteration-i derived stateRoot.
+		assert.Equal(t, g.StateRootForIteration(i), data.StateRoot, "iteration %d stateRoot", i)
+		assert.NotEqual(t, originalHash, data.BlockHash, "iteration %d blockHash matches original", i)
+
+		// blockHash matches a fresh recomputation.
+		expected, err := engine.ExecutableDataToBlockNoHash(data, nil, beaconRoot, [][]byte{})
+		require.NoError(t, err)
+		assert.Equal(t, expected.Hash(), data.BlockHash, "iteration %d blockHash mismatch", i)
+
+		seenStateRoots[data.StateRoot] = struct{}{}
+		seenBlockHashes[data.BlockHash] = struct{}{}
+	}
+
+	// All stateRoots and blockHashes are unique across iterations.
+	assert.Len(t, seenStateRoots, count)
+	assert.Len(t, seenBlockHashes, count)
+}
+
+func TestTransformLines_ExpandsNewPayloadAndPassesThroughOthers(t *testing.T) {
+	originalStateRoot := common.HexToHash("0xde94bab83ce96d440db7a3e2dc95ebbab73dc5aa88dc80b3d99ae8f0cff4e96c")
+	newPayload, _, _, _ := makeNewPayloadLine(t, originalStateRoot)
 	fcu := `{"jsonrpc":"2.0","id":2,"method":"engine_forkchoiceUpdatedV3","params":[]}`
 
-	g, err := NewGenerator(ForkOsaka)
+	const count = 3
+
+	g, err := NewGenerator(ForkOsaka, count)
+	require.NoError(t, err)
+
+	out, err := g.TransformLines([]string{newPayload, fcu})
+	require.NoError(t, err)
+
+	// 3 newPayload variants + 1 fcu = 4 lines.
+	require.Len(t, out, count+1)
+
+	// FCU is the last entry, unchanged.
+	assert.Equal(t, fcu, out[count])
+
+	// First `count` entries are newPayload variants, all different from the
+	// original line.
+	for i := range count {
+		assert.NotEqual(t, newPayload, out[i], "variant %d should differ from original", i)
+	}
+}
+
+func TestTransformLines_CountOnePreservesLength(t *testing.T) {
+	originalStateRoot := common.HexToHash("0xde94bab83ce96d440db7a3e2dc95ebbab73dc5aa88dc80b3d99ae8f0cff4e96c")
+	newPayload, _, _, _ := makeNewPayloadLine(t, originalStateRoot)
+	fcu := `{"jsonrpc":"2.0","id":2,"method":"engine_forkchoiceUpdatedV3","params":[]}`
+
+	g, err := NewGenerator(ForkOsaka, 1)
 	require.NoError(t, err)
 
 	out, err := g.TransformLines([]string{newPayload, fcu})
 	require.NoError(t, err)
 	require.Len(t, out, 2)
-
-	// Second line passes through unchanged.
 	assert.Equal(t, fcu, out[1])
-
-	// First line has been rewritten (different from original because stateRoot/blockHash changed).
 	assert.NotEqual(t, newPayload, out[0])
 }
