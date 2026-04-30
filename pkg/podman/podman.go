@@ -115,6 +115,10 @@ func (m *manager) Start(ctx context.Context) error {
 		"runtime": info.Host.OCIRuntime.Name,
 	}).Debug("Connected to Podman daemon")
 
+	m.log.WithField("nofile", docker.HostMaxNofile()).Info(
+		"Container RLIMIT_NOFILE bumped to host kernel max",
+	)
+
 	return nil
 }
 
@@ -247,6 +251,16 @@ func (m *manager) CreateContainer(
 			spec.NetworkName: {},
 		}
 	}
+
+	// Bump RLIMIT_NOFILE to the kernel's hard ceiling so EL clients
+	// don't trip "too many open files" errors during long benchmark
+	// runs. Applied to every container we create.
+	nofile := docker.HostMaxNofile()
+	s.Rlimits = append(s.Rlimits, specs.POSIXRlimit{
+		Type: "RLIMIT_NOFILE",
+		Hard: nofile,
+		Soft: nofile,
+	})
 
 	// Apply resource limits.
 	if spec.ResourceLimits != nil {
