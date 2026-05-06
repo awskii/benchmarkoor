@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import clsx from 'clsx'
 import { Grid3X3, X, Maximize2 } from 'lucide-react'
 import type { SuiteTest } from '@/api/types'
 import { getGroupedOpcodes, getCategoryColor } from '@/utils/opcodeCategories'
 import type { CategorySpan, GroupedResult } from '@/utils/opcodeCategories'
+import { TestName } from '@/components/shared/TestName'
+import { testNameMatches } from '@/utils/eestNameFilter'
 
 /** Returns the opcode count map from the top-level field or EEST info fallback. */
 function getOpcodeCount(test: SuiteTest): Record<string, number> | undefined {
@@ -129,7 +132,7 @@ interface HeatmapCanvasProps {
 function HeatmapCanvas({ filteredTests, columns, maxPerColumn, isDark, maxHeight, expanded, categorySpans, getCount, sortCol, onSortChange, onTestClick, extraColumns = [] }: HeatmapCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const [tooltip, setTooltip] = useState<{ lines: { text: string; bold?: boolean }[]; x: number; y: number } | null>(null)
+  const [tooltip, setTooltip] = useState<{ lines: { text: string; bold?: boolean }[]; testName?: string; x: number; y: number } | null>(null)
   const hoverRef = useRef<{ row: number; col: number } | null>(null)
   const rafRef = useRef(0)
 
@@ -549,8 +552,8 @@ function HeatmapCanvas({ filteredTests, columns, maxPerColumn, isDark, maxHeight
                   lines: [
                     { text: `Test #${filteredTests[row].index + 1}` },
                     { text: `${ec.name}: ${formatted}`, bold: true },
-                    { text: filteredTests[row].test.name },
                   ],
+                  testName: filteredTests[row].test.name,
                   x: e.clientX,
                   y: e.clientY - 12,
                 })
@@ -630,8 +633,8 @@ function HeatmapCanvas({ filteredTests, columns, maxPerColumn, isDark, maxHeight
             lines: [
               { text: `Test #${filteredTests[row].index + 1}` },
               { text: `${colName}: ${count.toLocaleString()}`, bold: true },
-              { text: test.name },
             ],
+            testName: test.name,
             x: e.clientX,
             y: e.clientY - 12,
           })
@@ -717,12 +720,17 @@ function HeatmapCanvas({ filteredTests, columns, maxPerColumn, isDark, maxHeight
       </div>
       {tooltip && (
         <div
-          className="pointer-events-none fixed z-50 flex max-w-sm flex-col gap-1 break-all rounded-xs bg-gray-900 px-2 py-1.5 text-xs text-white shadow-xs dark:bg-gray-700"
+          className="pointer-events-none fixed z-50 flex max-w-sm flex-col gap-1 rounded-xs bg-gray-900 px-2 py-1.5 text-xs text-white shadow-xs dark:bg-gray-700"
           style={{ left: tooltip.x, top: tooltip.y, transform: 'translate(-50%, -100%)' }}
         >
           {tooltip.lines.map((line, i) => (
-            <div key={i} className={line.bold ? 'font-bold' : undefined}>{line.text}</div>
+            <div key={i} className={clsx('break-all', line.bold && 'font-bold')}>{line.text}</div>
           ))}
+          {tooltip.testName && (
+            <div className="border-t border-white/10 pt-1 text-white">
+              <TestName name={tooltip.testName} />
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -766,8 +774,7 @@ export function OpcodeHeatmap({ tests, onTestClick, extraColumns = [], searchQue
 
   const filteredTests = useMemo(() => {
     if (!search) return testsWithOpcodes
-    const q = search.toLowerCase()
-    return testsWithOpcodes.filter((t) => t.test.name.toLowerCase().includes(q))
+    return testsWithOpcodes.filter((t) => testNameMatches(t.test.name, search))
   }, [testsWithOpcodes, search])
 
   const allOpcodes = useMemo(() => {
@@ -937,7 +944,8 @@ export function OpcodeHeatmap({ tests, onTestClick, extraColumns = [], searchQue
         <div className="flex items-center gap-2">
           <input
             type="text"
-            placeholder="Filter tests..."
+            placeholder="Filter… or e.g. opcode:ORIGIN"
+            title={'Free text matches the raw name. Or filter by extracted fields:\nopcode:ORIGIN  gas:90M  fork:Amsterdam  file:tx_context  fn:codecopy  path:compute  label:LOG1\nUnrecognized keys hit params: mem_size:1024  code_size:0\nMultiple terms are AND.'}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="rounded-xs border border-gray-300 bg-white px-3 py-1 text-sm/6 placeholder-gray-400 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-500"

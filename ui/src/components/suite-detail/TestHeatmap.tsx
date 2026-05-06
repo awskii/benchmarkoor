@@ -7,6 +7,8 @@ import { ClientBadge } from '@/components/shared/ClientBadge'
 import { JDenticon } from '@/components/shared/JDenticon'
 import { Pagination } from '@/components/shared/Pagination'
 import { Spinner } from '@/components/shared/Spinner'
+import { TestName } from '@/components/shared/TestName'
+import { testNameMatches } from '@/utils/eestNameFilter'
 import { formatTimestamp } from '@/utils/date'
 
 const DEFAULT_PAGE_SIZE = 20
@@ -404,8 +406,9 @@ export function TestHeatmap({ stats, testFiles, isDark, isLoading, suiteHash, su
         return allTests
       }
     }
-    const lower = search.toLowerCase()
-    return allTests.filter((t) => t.name.toLowerCase().includes(lower))
+    return allTests.filter((t) => testNameMatches(t.name, search))
+  // When useRegex is on, the early return above handles filtering; this
+  // branch only fires in text mode.
   }, [allTests, search, useRegex])
 
   // Sort and paginate
@@ -524,7 +527,10 @@ export function TestHeatmap({ stats, testFiles, isDark, isLoading, suiteHash, su
           type="text"
           value={search}
           onChange={(e) => handleSearchChange(e.target.value)}
-          placeholder={useRegex ? 'Regex...' : 'Filter...'}
+          placeholder={useRegex ? 'Regex...' : 'Filter or e.g. opcode:ORIGIN'}
+          title={useRegex
+            ? 'Regex against the raw test name.'
+            : 'Free text matches the raw name. Or filter by extracted fields:\nopcode:ORIGIN  gas:90M  fork:Amsterdam  file:tx_context  fn:codecopy  path:compute  label:LOG1\nUnrecognized keys hit params: mem_size:1024  code_size:0\nMultiple terms are AND.'}
           className={clsx(
             'w-28 rounded-xs border bg-white px-2 py-1 text-sm placeholder-gray-400 focus:outline-hidden focus:ring-1 sm:w-auto sm:px-3 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-500',
             useRegex && search && (() => { try { new RegExp(search); return false } catch { return true } })()
@@ -719,11 +725,17 @@ export function TestHeatmap({ stats, testFiles, isDark, isLoading, suiteHash, su
                 <tr className="border-t border-gray-100 bg-gray-50/80 dark:border-gray-700/50 dark:bg-gray-900/60">
                   <td
                     colSpan={clients.length + 1 + STAT_COLUMNS.length}
-                    className="truncate px-3 py-1 font-mono text-xs/5 text-gray-400 dark:text-gray-500"
+                    className="truncate px-3 py-1 text-xs/5 text-gray-400 dark:text-gray-500"
                     title={test.name}
                   >
                     <span className="mr-1.5 font-sans text-gray-300 dark:text-gray-600">&#9656;</span>
-                    <HighlightedName name={test.name} search={search} useRegex={useRegex} />
+                    {search ? (
+                      <span className="font-mono">
+                        <HighlightedName name={test.name} search={search} useRegex={useRegex} />
+                      </span>
+                    ) : (
+                      <TestName name={test.name} />
+                    )}
                   </td>
                 </tr>
               )}

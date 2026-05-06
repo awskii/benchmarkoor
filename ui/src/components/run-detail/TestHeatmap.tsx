@@ -5,6 +5,8 @@ import { Check, Copy, Download } from 'lucide-react'
 import type { TestEntry, SuiteTest, AggregatedStats, MethodsAggregated, StepResult, PostTestRPCCallConfig } from '@/api/types'
 import { fetchHead } from '@/api/client'
 import { Modal } from '@/components/shared/Modal'
+import { TestName } from '@/components/shared/TestName'
+import { testNameMatches } from '@/utils/eestNameFilter'
 import { TimeBreakdown } from './TimeBreakdown'
 import { MGasBreakdown } from './MGasBreakdown'
 import { ExecutionsList } from './ExecutionsList'
@@ -310,7 +312,7 @@ function HeatmapCell({
     // ran-and-failed tests cleanly.
     (!test.notProcessed && statusFilter === 'passed' && !test.hasFail) ||
     (!test.notProcessed && statusFilter === 'failed' && test.hasFail)
-  const matchesSearchQuery = !searchQuery || test.testKey.toLowerCase().includes(searchQuery.toLowerCase())
+  const matchesSearchQuery = !searchQuery || testNameMatches(test.testKey, searchQuery)
   const matchesFilter = matchesStatusFilter && matchesSearchQuery
   let baseStyle: React.CSSProperties
   if (test.notProcessed) {
@@ -348,6 +350,14 @@ function HeatmapCell({
       )}
       style={style}
     />
+  )
+}
+
+function TooltipFilename({ name }: { name: string }) {
+  return (
+    <div className="w-64 max-w-[80vw]">
+      <TestName name={name} />
+    </div>
   )
 }
 
@@ -905,7 +915,7 @@ export function TestHeatmap({
               </>
             )}
             <div className="text-gray-500 dark:text-gray-400">Based on steps: {stepFilter.join(', ')}</div>
-            <div className="w-48 break-all text-gray-500 dark:text-gray-400">{tooltip.test.filename}</div>
+            <TooltipFilename name={tooltip.test.filename} />
             {tooltip.test.notProcessed ? (
               <div className="text-gray-500 dark:text-gray-400">Test was not run</div>
             ) : tooltip.test.noData ? (
@@ -934,10 +944,8 @@ export function TestHeatmap({
             <div className="flex flex-col gap-6">
               <div className="flex flex-col gap-2">
                 <div>
-                  <div className="text-xs/5 font-medium text-gray-500 dark:text-gray-400">Test Name</div>
-                  <div className="flex items-center gap-2 text-sm/6 text-gray-900 dark:text-gray-100">
-                    <span className="min-w-0 break-all">{selectedTest}</span>
-                    <CopyButton text={selectedTest} />
+                  <div className="text-sm/6 text-gray-900 dark:text-gray-100">
+                    <TestName name={selectedTest} showRawBelow showCopy className="min-w-0" />
                   </div>
                 </div>
                 {entry.dir && (
