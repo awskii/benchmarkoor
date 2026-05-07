@@ -9,6 +9,8 @@ import { useIndex } from '@/api/hooks/useIndex'
 import { useSuite } from '@/api/hooks/useSuite'
 import { LoadingState } from '@/components/shared/Spinner'
 import { JDenticon } from '@/components/shared/JDenticon'
+import { FacetPanel } from '@/components/shared/FacetPanel'
+import { CompareDimensionInsights } from '@/components/compare/CompareDimensionInsights'
 import { type StepTypeOption, ALL_STEP_TYPES, DEFAULT_STEP_FILTER } from '@/pages/RunDetailPage'
 import { type CompareRun, type ChartType, CHART_TYPE_OPTIONS } from '@/components/compare/constants'
 import { MetricsComparison } from '@/components/compare/MetricsComparison'
@@ -644,6 +646,12 @@ export function CompareGroupsPage() {
             )}
           </div>
 
+          <FacetPanel
+            testNames={[...testGasMap.keys()]}
+            query={testFilter}
+            onToggle={(term) => updateSearch({ filter: toggleSearchTerm(testFilter, term) || undefined })}
+          />
+
           <MetricsComparison
             runs={syntheticRuns}
             stepFilter={stepFilter}
@@ -703,6 +711,17 @@ export function CompareGroupsPage() {
             zoomRange={sharedZoom ? chartZoom : undefined}
             onZoomChange={sharedZoom ? setChartZoom : undefined}
             chartType={chartType}
+            onTestClick={setSelectedTest}
+          />
+
+          <CompareDimensionInsights
+            runs={syntheticRuns}
+            stepFilter={stepFilter}
+            baselineIdx={baselineIdx}
+            labelMode="instance-id"
+            testNameFilter={testNameFilter}
+            query={testFilter}
+            onToggle={(term) => updateSearch({ filter: toggleSearchTerm(testFilter, term) || undefined })}
             onTestClick={setSelectedTest}
           />
 

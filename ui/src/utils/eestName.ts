@@ -61,7 +61,22 @@ const IGNORE_TOKENS = new Set([
   'gas',
 ])
 
+// parseEESTName is called from multiple memos (FacetPanel, DimensionInsights,
+// TestHeatmap, …) and indirectly from testNameMatches. With ~7000 tests and
+// several dimensions, that adds up to >100k regex+split runs per filter
+// change. Cache by raw name — names are stable per session, the result is
+// pure, and total cardinality is bounded by the run/suite size.
+const parseCache = new Map<string, EESTNameParts>()
+
 export function parseEESTName(raw: string): EESTNameParts {
+  const cached = parseCache.get(raw)
+  if (cached) return cached
+  const result = parseEESTNameUncached(raw)
+  parseCache.set(raw, result)
+  return result
+}
+
+function parseEESTNameUncached(raw: string): EESTNameParts {
   const m = FILE_FN_RE.exec(raw)
   if (!m) {
     return { raw, isEEST: false, params: [], labels: [], short: raw }
@@ -136,4 +151,24 @@ export function parseEESTName(raw: string): EESTNameParts {
 export function formatTestName(name: string, mode: 'raw' | 'decomposed'): string {
   if (mode === 'raw') return name
   return parseEESTName(name).short
+}
+
+/**
+ * Same intent as `formatTestName`, but includes every decomposed field
+ * (file, fn, gas, opcode, fork, params, labels) — for chart tooltips and
+ * other contexts where we have room to show everything.
+ */
+export function formatTestNameLong(name: string, mode: 'raw' | 'decomposed'): string {
+  if (mode === 'raw') return name
+  const p = parseEESTName(name)
+  if (!p.isEEST) return name
+  const parts: string[] = []
+  if (p.file) parts.push(p.file)
+  if (p.fn) parts.push(p.fn)
+  if (p.benchmark) parts.push(p.benchmark)
+  if (p.opcode) parts.push(p.opcode)
+  if (p.fork) parts.push(`fork:${p.fork}`)
+  for (const { key, value } of p.params) parts.push(`${key}:${value}`)
+  for (const label of p.labels) parts.push(label)
+  return parts.length > 0 ? parts.join(' · ') : name
 }

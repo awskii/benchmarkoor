@@ -3,10 +3,10 @@ import clsx from 'clsx'
 import { ChevronDown, ChevronUp, Filter, X } from 'lucide-react'
 import { parseEESTName } from '@/utils/eestName'
 import {
+  compileQuery,
   queryWithoutDimension,
   searchQueryContains,
   splitQuery,
-  testNameMatches,
 } from '@/utils/eestNameFilter'
 
 interface FacetPanelProps {
@@ -112,10 +112,11 @@ export function FacetPanel({ testNames, query, onToggle }: FacetPanelProps) {
       // dimension, so picking another opcode value doesn't show 0 counts
       // everywhere just because a sibling opcode is selected.
       const contextQuery = queryWithoutDimension(query, def.key)
+      const matchesContext = contextQuery ? compileQuery(contextQuery) : null
       const counts = new Map<string, number>()
 
       for (const p of parsed) {
-        if (contextQuery && !testNameMatches(p.name, contextQuery)) continue
+        if (matchesContext && !matchesContext(p.name)) continue
         const vs = p.dims.get(def.key)
         if (!vs) continue
         for (const v of vs) counts.set(v, (counts.get(v) ?? 0) + 1)
@@ -183,7 +184,7 @@ export function FacetPanel({ testNames, query, onToggle }: FacetPanelProps) {
               onClick={() => onToggle(term)}
               title={active ? `Click to remove ${term}` : `Click to filter by ${term}`}
               className={clsx(
-                'inline-flex items-center gap-1 rounded-xs px-1.5 py-0 font-mono text-[11px]/5 ring-1 ring-inset transition-colors',
+                'inline-flex cursor-pointer items-center gap-1 rounded-xs px-1.5 py-0 font-mono text-[11px]/5 ring-1 ring-inset transition-colors',
                 active
                   ? 'bg-blue-500 text-white ring-blue-500'
                   : dimmed
@@ -224,7 +225,7 @@ export function FacetPanel({ testNames, query, onToggle }: FacetPanelProps) {
           <button
             type="button"
             onClick={() => setShowAll(!showAll)}
-            className="flex w-fit items-center gap-1 rounded-xs px-1.5 py-1 text-xs/5 font-medium text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-100"
+            className="flex w-fit cursor-pointer items-center gap-1 rounded-xs px-1.5 py-1 text-xs/5 font-medium text-gray-600 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-700 dark:hover:text-gray-100"
           >
             {showAll
               ? <><ChevronUp className="size-3.5" /> Show fewer facets</>
