@@ -2780,6 +2780,11 @@ func TestValidateWarmupTestPayload(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name:    "enabled with explicit invalid-gasused method is valid",
+			global:  &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka", Method: "invalid-gasused"},
+			wantErr: false,
+		},
+		{
 			name:    "enabled with empty method defaults (valid)",
 			global:  &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka", Method: ""},
 			wantErr: false,
@@ -2788,7 +2793,7 @@ func TestValidateWarmupTestPayload(t *testing.T) {
 			name:      "enabled with unknown method is invalid",
 			global:    &WarmupTestPayloadConfig{Enabled: true, Fork: "osaka", Method: "rewrite-everything"},
 			wantErr:   true,
-			errSubstr: `warmup_test_payload.method must be "invalid-stateroot"`,
+			errSubstr: `warmup_test_payload.method must be "invalid-stateroot" or "invalid-gasused"`,
 		},
 	}
 

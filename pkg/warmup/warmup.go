@@ -1,9 +1,11 @@
 // Package warmup generates "warmup" engine_newPayload* requests by taking
-// the new-payload calls from a test step, replacing the stateRoot with a
-// fork-specific placeholder derived from a salt and an iteration index, and
-// recomputing the blockHash so the EL client accepts the payload header
-// and proceeds to execute it. The point of warmup is to populate caches
-// before the real test runs.
+// the new-payload calls from a test step, mutating one header field per
+// iteration, and recomputing the blockHash so the EL client accepts the
+// payload header and proceeds to execute it. Two mutation strategies are
+// supported: replacing the stateRoot with a deterministic placeholder
+// ("invalid-stateroot") or subtracting 1+i from gasUsed
+// ("invalid-gasused"). Either way the point of warmup is to populate
+// caches before the real test runs.
 package warmup
 
 import (
@@ -28,6 +30,20 @@ const (
 	ForkOsaka Fork = "osaka"
 )
 
+// Method selects how each warmup iteration mutates an engine_newPayload*
+// header field before the blockHash is recomputed.
+type Method string
+
+const (
+	// MethodInvalidStateRoot rewrites stateRoot to a deterministic
+	// per-iteration value derived from a salt and the iteration index.
+	MethodInvalidStateRoot Method = "invalid-stateroot"
+	// MethodInvalidGasUsed subtracts (1+i) from the original gasUsed for
+	// iteration i (so iteration 0 = original-1, iteration 1 = original-2,
+	// and so on). stateRoot and the other fields are left untouched.
+	MethodInvalidGasUsed Method = "invalid-gasused"
+)
+
 // OsakaWarmupSalt is the 32-byte salt mixed with the iteration index to
 // derive the warmup stateRoot. Picked as an arbitrary non-zero constant so
 // the resulting roots are non-empty and deterministic across runs.
@@ -38,23 +54,39 @@ func IsValidFork(fork string) bool {
 	return Fork(fork) == ForkOsaka
 }
 
-// Generator transforms engine_newPayload* JSON-RPC lines into warmup
-// equivalents (modified stateRoot + recomputed blockHash). Each
-// engine_newPayload* line expands to Count variants, each with a different
-// stateRoot derived from a salt and the iteration index. Lines whose
-// method is not engine_newPayload* are returned unchanged (a single copy
-// regardless of Count).
-type Generator struct {
-	fork  Fork
-	count int
-	salt  []byte
+// IsValidMethod returns true if the given method identifier is supported.
+func IsValidMethod(method string) bool {
+	m := Method(method)
+
+	return m == MethodInvalidStateRoot || m == MethodInvalidGasUsed
 }
 
-// NewGenerator returns a Generator for the given fork. Currently only
-// ForkOsaka is accepted. Count <= 0 is treated as 1.
-func NewGenerator(fork Fork, count int) (*Generator, error) {
+// Generator transforms engine_newPayload* JSON-RPC lines into warmup
+// equivalents. Per-iteration mutation is selected by Method; the
+// blockHash is always recomputed afterwards. Each engine_newPayload* line
+// expands to Count variants. Lines whose method is not engine_newPayload*
+// are returned unchanged (a single copy regardless of Count).
+type Generator struct {
+	fork   Fork
+	method Method
+	count  int
+	salt   []byte
+}
+
+// NewGenerator returns a Generator for the given fork and method.
+// Currently only ForkOsaka is accepted. Method must be one of
+// MethodInvalidStateRoot or MethodInvalidGasUsed. Count <= 0 is treated
+// as 1.
+func NewGenerator(fork Fork, method Method, count int) (*Generator, error) {
 	if fork != ForkOsaka {
 		return nil, fmt.Errorf("unsupported fork %q (only %q is supported)", fork, ForkOsaka)
+	}
+
+	if !IsValidMethod(string(method)) {
+		return nil, fmt.Errorf(
+			"unsupported method %q (supported: %q, %q)",
+			method, MethodInvalidStateRoot, MethodInvalidGasUsed,
+		)
 	}
 
 	if count <= 0 {
@@ -64,9 +96,10 @@ func NewGenerator(fork Fork, count int) (*Generator, error) {
 	salt := common.FromHex(OsakaWarmupSalt)
 
 	return &Generator{
-		fork:  fork,
-		count: count,
-		salt:  salt,
+		fork:   fork,
+		method: method,
+		count:  count,
+		salt:   salt,
 	}, nil
 }
 
@@ -76,8 +109,14 @@ func (g *Generator) Count() int {
 	return g.count
 }
 
+// Method returns the configured per-iteration mutation method.
+func (g *Generator) Method() Method {
+	return g.method
+}
+
 // StateRootForIteration returns the deterministic stateRoot used for
-// warmup iteration i. It is exported primarily for tests.
+// warmup iteration i when the method is MethodInvalidStateRoot. It is
+// exported primarily for tests.
 func (g *Generator) StateRootForIteration(i int) common.Hash {
 	buf := make([]byte, 0, len(g.salt)+8)
 	buf = append(buf, g.salt...)
@@ -87,6 +126,44 @@ func (g *Generator) StateRootForIteration(i int) common.Hash {
 	buf = append(buf, ibe[:]...)
 
 	return common.BytesToHash(crypto.Keccak256(buf))
+}
+
+// GasUsedForIteration returns the gasUsed value used for warmup iteration
+// i when the method is MethodInvalidGasUsed: original - (i+1). Returns
+// an error if the subtraction would underflow (i.e. original gasUsed is
+// smaller than the iteration count requires).
+func (g *Generator) GasUsedForIteration(original uint64, i int) (uint64, error) {
+	delta := uint64(i + 1) //nolint:gosec // i is non-negative.
+	if delta > original {
+		return 0, fmt.Errorf(
+			"cannot subtract %d from gasUsed %d (would underflow)", delta, original,
+		)
+	}
+
+	return original - delta, nil
+}
+
+// applyMutation rewrites a single header field on the payload to make
+// iteration i distinct from the original (and from other iterations). The
+// blockHash is recomputed by the caller after this returns.
+func (g *Generator) applyMutation(data *engine.ExecutableData, i int) error {
+	switch g.method {
+	case MethodInvalidStateRoot:
+		data.StateRoot = g.StateRootForIteration(i)
+
+		return nil
+	case MethodInvalidGasUsed:
+		gas, err := g.GasUsedForIteration(data.GasUsed, i)
+		if err != nil {
+			return err
+		}
+
+		data.GasUsed = gas
+
+		return nil
+	default:
+		return fmt.Errorf("unsupported method %q", g.method)
+	}
 }
 
 // Transform rewrites a single JSON-RPC line. Non-engine_newPayload* lines
@@ -132,12 +209,14 @@ func (g *Generator) Transform(line string) ([]string, error) {
 	out := make([]string, 0, g.count)
 
 	for i := range g.count {
-		// Replace stateRoot for this iteration and recompute blockHash.
+		// Mutate one header field per iteration and recompute blockHash.
 		// ExecutableDataToBlockNoHash builds a block with all derived roots
 		// (txRoot, withdrawalsRoot, requestsHash) without verifying the
 		// supplied blockHash matches.
 		variant := data
-		variant.StateRoot = g.StateRootForIteration(i)
+		if err := g.applyMutation(&variant, i); err != nil {
+			return nil, fmt.Errorf("iteration %d: %w", i, err)
+		}
 
 		block, err := engine.ExecutableDataToBlockNoHash(variant, versionedHashes, beaconRoot, requests)
 		if err != nil {

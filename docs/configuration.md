@@ -982,7 +982,12 @@ When using the `container-recreate` rollback strategy, the bootstrap FCU is sent
 
 ##### Warmup Test Payload
 
-The `warmup_test_payload` option inserts a warmup phase between the setup and test steps. The exact transformation is selected by `method`; today only `invalid-stateroot` is supported, which rewrites each `engine_newPayload*` call's `stateRoot` to a deterministic placeholder and recomputes `blockHash`. The client is expected to reject the resulting payload on state-root mismatch — the value is in the work it performs first (cache fills, codepath warming) before that rejection.
+The `warmup_test_payload` option inserts a warmup phase between the setup and test steps. The exact transformation is selected by `method`:
+
+- `invalid-stateroot` (default): rewrites each `engine_newPayload*` call's `stateRoot` to a deterministic per-iteration placeholder and recomputes `blockHash`. The client typically rejects on state-root mismatch.
+- `invalid-gasused`: keeps `stateRoot`, subtracts `(1+i)` from `gasUsed` for iteration `i` (so iteration 0 = original-1, iteration 1 = original-2, …), and recomputes `blockHash`. The client typically rejects once it notices the gas mismatch.
+
+Both methods do real header validation + tx decoding + execution work before the rejection, which is where the cache-warming value comes from.
 
 ```yaml
 runner:
@@ -998,9 +1003,9 @@ runner:
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
 | `enabled` | bool | Yes | `false` | Enable the warmup phase |
-| `method` | string | No | `invalid-stateroot` | Warmup strategy. Currently only `invalid-stateroot` is supported (rewrites stateRoot + recomputes blockHash). Future methods will be added as separate strings |
+| `method` | string | No | `invalid-stateroot` | Warmup strategy: `invalid-stateroot` (rewrites stateRoot + recomputes blockHash) or `invalid-gasused` (subtracts `1+i` from gasUsed + recomputes blockHash) |
 | `fork` | string | Yes | - | Fork used to compute the warmup `blockHash`. Only `osaka` is currently supported |
-| `count` | int | No | `1` | How many times each `engine_newPayload*` line is sent. Each iteration uses a different deterministic stateRoot (derived as `keccak256(salt ‖ uint64BE(i))`), so the client treats the calls as distinct payloads. Must be `>= 1` when enabled. Non-newPayload lines are sent once regardless |
+| `count` | int | No | `1` | How many times each `engine_newPayload*` line is sent. Each iteration produces a distinct payload (per-iteration stateRoot for `invalid-stateroot` derived as `keccak256(salt ‖ uint64BE(i))`, or `original-(1+i)` gasUsed for `invalid-gasused`) so the client treats the calls as distinct. Must be `>= 1` when enabled. Non-newPayload lines are sent once regardless. For `invalid-gasused`, count must not exceed the smallest original `gasUsed` in the step or the warmup fails with an underflow error |
 
 `warmup_test_payload` can be set globally under `runner.client.config` and/or per-instance under `runner.instances[]`. Instance-level config (when non-nil) fully replaces the global default.
 

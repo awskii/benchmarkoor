@@ -520,24 +520,32 @@ type BootstrapFCUConfig struct {
 	HeadBlockHash string `yaml:"head_block_hash" mapstructure:"head_block_hash" json:"head_block_hash,omitempty"`
 }
 
-// WarmupMethodInvalidStateRoot is the only warmup method currently
-// supported. The runner takes each engine_newPayload* call from the test
-// step, replaces stateRoot with a deterministically-derived placeholder,
-// and recomputes blockHash. The client typically rejects the payload on
-// state-root mismatch, but the work it does first warms its caches.
-const WarmupMethodInvalidStateRoot = "invalid-stateroot"
+// Supported warmup methods. Both rewrite a single header field on each
+// engine_newPayload* call and recompute blockHash; the client typically
+// rejects the resulting payload but warms its caches first.
+//
+//   - WarmupMethodInvalidStateRoot replaces stateRoot with a
+//     deterministically-derived placeholder.
+//   - WarmupMethodInvalidGasUsed subtracts (1+i) from gasUsed for
+//     iteration i (so iteration 0 = original-1, iteration 1 = original-2,
+//     and so on). stateRoot is left untouched.
+const (
+	WarmupMethodInvalidStateRoot = "invalid-stateroot"
+	WarmupMethodInvalidGasUsed   = "invalid-gasused"
+)
 
 // WarmupTestPayloadConfig configures the warmup phase that runs between
 // setup and test steps. The behavior is determined by Method.
 //
-// Count controls how many times each engine_newPayload* line is sent. Each
-// iteration uses a different (deterministically derived) stateRoot so the
-// client treats the calls as distinct payloads. Default is 1; must be >= 1
-// when enabled. Non-newPayload lines (e.g. forkchoiceUpdated) are sent once
-// regardless of Count.
+// Count controls how many times each engine_newPayload* line is sent.
+// Each iteration produces a distinct payload (per-iteration stateRoot for
+// "invalid-stateroot", or original-(1+i) gasUsed for "invalid-gasused")
+// so the client treats the calls as distinct. Default is 1; must be >= 1
+// when enabled. Non-newPayload lines (e.g. forkchoiceUpdated) are sent
+// once regardless of Count.
 //
-// Method selects the warmup strategy. Currently only "invalid-stateroot"
-// (the default) is supported.
+// Method selects the warmup strategy: "invalid-stateroot" (default) or
+// "invalid-gasused".
 type WarmupTestPayloadConfig struct {
 	Enabled bool   `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
 	Fork    string `yaml:"fork" mapstructure:"fork" json:"fork,omitempty"`
@@ -2317,10 +2325,12 @@ func (c *Config) validateWarmupTestPayload() error {
 
 		// Empty method is allowed (defaults to invalid-stateroot via
 		// EffectiveMethod). A non-empty method must be one we recognize.
-		if cfg.Method != "" && cfg.Method != WarmupMethodInvalidStateRoot {
+		if cfg.Method != "" &&
+			cfg.Method != WarmupMethodInvalidStateRoot &&
+			cfg.Method != WarmupMethodInvalidGasUsed {
 			return fmt.Errorf(
-				"instance %q: warmup_test_payload.method must be %q (got %q)",
-				instance.ID, WarmupMethodInvalidStateRoot, cfg.Method,
+				"instance %q: warmup_test_payload.method must be %q or %q (got %q)",
+				instance.ID, WarmupMethodInvalidStateRoot, WarmupMethodInvalidGasUsed, cfg.Method,
 			)
 		}
 	}
