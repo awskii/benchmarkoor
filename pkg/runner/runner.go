@@ -190,6 +190,7 @@ type ResolvedInstance struct {
 	BootstrapFCU                     *config.BootstrapFCUConfig               `json:"bootstrap_fcu,omitempty"`
 	CheckpointRestoreStrategyOptions *config.CheckpointRestoreStrategyOptions `json:"checkpoint_restore_strategy_options,omitempty"`
 	WarmupTestPayload                *config.WarmupTestPayloadConfig          `json:"warmup_test_payload,omitempty"`
+	OpcodeExtraction                 *config.OpcodeExtractionConfig           `json:"opcode_extraction,omitempty"`
 }
 
 // NewRunner creates a new runner instance.

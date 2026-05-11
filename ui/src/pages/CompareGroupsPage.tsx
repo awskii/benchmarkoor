@@ -1,13 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react'
 import { Link, useSearch, useNavigate } from '@tanstack/react-router'
 import { useQueries } from '@tanstack/react-query'
 import clsx from 'clsx'
 import type { RunConfig, RunResult } from '@/api/types'
 import { fetchData } from '@/api/client'
+import { testNameMatches, toggleSearchTerm, TEST_FILTER_HINT } from '@/utils/eestNameFilter'
 import { useIndex } from '@/api/hooks/useIndex'
 import { useSuite } from '@/api/hooks/useSuite'
 import { LoadingState } from '@/components/shared/Spinner'
 import { JDenticon } from '@/components/shared/JDenticon'
+import { FacetPanel } from '@/components/shared/FacetPanel'
+import { CompareDimensionInsights } from '@/components/compare/CompareDimensionInsights'
 import { type StepTypeOption, ALL_STEP_TYPES, DEFAULT_STEP_FILTER } from '@/pages/RunDetailPage'
 import { type CompareRun, type ChartType, CHART_TYPE_OPTIONS } from '@/components/compare/constants'
 import { MetricsComparison } from '@/components/compare/MetricsComparison'
@@ -80,6 +83,19 @@ export function CompareGroupsPage() {
       })
     },
     [navigate, search],
+  )
+
+  // Filter changes fan out into many synchronous re-renders (charts, table,
+  // facet panel, dimension insights, with N runs each). Wrapping the URL
+  // update in `startTransition` marks the resulting work as interruptible
+  // so chip clicks and keystrokes feel instant even when the downstream
+  // work takes hundreds of ms.
+  const [, startFilterTransition] = useTransition()
+  const updateFilterSearch = useCallback(
+    (patch: Record<string, string | undefined>) => {
+      startFilterTransition(() => updateSearch(patch))
+    },
+    [updateSearch],
   )
 
   const setSuiteHash = useCallback(
@@ -157,6 +173,28 @@ export function CompareGroupsPage() {
   })
 
   const isLoading = configQueries.some((q) => q.isLoading) || resultQueries.some((q) => q.isLoading)
+
+  // Per-group loading flag: true when this group's config or any of its
+  // result queries are still in-flight. Used to show spinners on the
+  // individual group cards.
+  const groupLoadingFlags = useMemo(() => {
+    const flags: boolean[] = []
+    let resultOffset = 0
+    for (let gi = 0; gi < groups.length; gi++) {
+      const runIds = groupRuns[gi] ?? []
+      const configLoading = configQueries[gi]?.isLoading ?? false
+      let resultsLoading = false
+      for (let ri = 0; ri < runIds.length; ri++) {
+        if (resultQueries[resultOffset + ri]?.isLoading) {
+          resultsLoading = true
+          break
+        }
+      }
+      resultOffset += runIds.length
+      flags.push(configLoading || resultsLoading)
+    }
+    return flags
+  }, [groups, groupRuns, configQueries, resultQueries])
 
   // ─── Compute averages and build synthetic CompareRun[] ─────────
   const { syntheticRuns, varianceMap } = useMemo(() => {
@@ -305,8 +343,7 @@ export function CompareGroupsPage() {
           return undefined
         }
       }
-      const q = testFilter.toLowerCase()
-      return (name: string) => name.toLowerCase().includes(q)
+      return (name: string) => testNameMatches(name, testFilter)
     })()
 
     const needsGasFilter = selectedGasBuckets.size > 0
@@ -408,6 +445,7 @@ export function CompareGroupsPage() {
         onAggModeChange={setAggMode}
         groupRunCounts={groupRuns.map((ids) => ids.length)}
         groupMatchedRuns={groupMatchedEntries}
+        groupLoadingFlags={groupLoadingFlags}
       />
       </div>
 
@@ -447,16 +485,19 @@ export function CompareGroupsPage() {
                 <span>Filter:</span>
                 <input
                   type="text"
-                  placeholder={testFilterRegex ? 'Regex...' : 'Filter...'}
+                  placeholder={testFilterRegex ? 'Regex...' : 'Filter or e.g. opcode:ORIGIN'}
+                  title={testFilterRegex
+                    ? 'Regex against the raw test name.'
+                    : TEST_FILTER_HINT}
                   value={testFilter}
-                  onChange={(e) => updateSearch({ filter: e.target.value || undefined })}
+                  onChange={(e) => updateFilterSearch({ filter: e.target.value || undefined })}
                   className={clsx(
                     'w-36 rounded-xs border bg-white px-2 py-0.5 text-xs/5 placeholder-gray-400 focus:outline-hidden focus:ring-1 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-500',
                     'border-gray-300 focus:border-blue-500 focus:ring-blue-500 dark:border-gray-600',
                   )}
                 />
                 <button
-                  onClick={() => updateSearch({ filterRegex: testFilterRegex ? undefined : '1' })}
+                  onClick={() => updateFilterSearch({ filterRegex: testFilterRegex ? undefined : '1' })}
                   title={testFilterRegex ? 'Regex mode' : 'Text mode'}
                   className={clsx(
                     'rounded-xs px-1 py-0.5 font-mono text-xs/5 transition-colors',
@@ -473,7 +514,7 @@ export function CompareGroupsPage() {
                   <span>Gas:</span>
                   <div className="flex flex-wrap gap-1">
                     <button
-                      onClick={() => updateSearch({ gasBuckets: undefined })}
+                      onClick={() => updateFilterSearch({ gasBuckets: undefined })}
                       className={clsx(
                         'rounded-xs px-2 py-0.5 text-xs/5 font-medium transition-colors',
                         selectedGasBuckets.size === 0
@@ -492,7 +533,7 @@ export function CompareGroupsPage() {
                             const next = new Set(selectedGasBuckets)
                             if (isSelected) next.delete(bucket); else next.add(bucket)
                             const sorted = [...next].sort((a, b) => a - b)
-                            updateSearch({ gasBuckets: sorted.length > 0 ? sorted.map((v) => String(v / 1_000_000)).join(',') : undefined })
+                            updateFilterSearch({ gasBuckets: sorted.length > 0 ? sorted.map((v) => String(v / 1_000_000)).join(',') : undefined })
                           }}
                           className={clsx(
                             'rounded-xs px-2 py-0.5 text-xs/5 font-medium transition-colors',
@@ -575,9 +616,10 @@ export function CompareGroupsPage() {
               <span>Filter:</span>
               <input
                 type="text"
-                placeholder={testFilterRegex ? 'Regex pattern...' : 'Filter tests...'}
+                placeholder={testFilterRegex ? 'Regex pattern...' : 'Filter… or e.g. opcode:ORIGIN'}
+                title={testFilterRegex ? 'Regex against the raw test name.' : TEST_FILTER_HINT}
                 value={testFilter}
-                onChange={(e) => updateSearch({ filter: e.target.value || undefined })}
+                onChange={(e) => updateFilterSearch({ filter: e.target.value || undefined })}
                 className={clsx(
                   'w-36 rounded-xs border bg-white px-2 py-0.5 text-xs/5 placeholder-gray-400 focus:outline-hidden focus:ring-1 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-500',
                   testFilterRegex && testFilter && (() => { try { new RegExp(testFilter); return false } catch { return true } })()
@@ -586,7 +628,7 @@ export function CompareGroupsPage() {
                 )}
               />
               <button
-                onClick={() => updateSearch({ filterRegex: testFilterRegex ? undefined : '1' })}
+                onClick={() => updateFilterSearch({ filterRegex: testFilterRegex ? undefined : '1' })}
                 title={testFilterRegex ? 'Regex mode (click to switch to text)' : 'Text mode (click to switch to regex)'}
                 className={clsx(
                   'rounded-xs px-1.5 py-0.5 font-mono text-xs/5 transition-colors',
@@ -603,7 +645,7 @@ export function CompareGroupsPage() {
                 <span>Gas:</span>
                 <div className="flex flex-wrap gap-1">
                   <button
-                    onClick={() => updateSearch({ gasBuckets: undefined })}
+                    onClick={() => updateFilterSearch({ gasBuckets: undefined })}
                     className={clsx(
                       'rounded-xs px-2 py-0.5 text-xs/5 font-medium transition-colors',
                       selectedGasBuckets.size === 0
@@ -622,7 +664,7 @@ export function CompareGroupsPage() {
                           const next = new Set(selectedGasBuckets)
                           if (isSelected) next.delete(bucket); else next.add(bucket)
                           const sorted = [...next].sort((a, b) => a - b)
-                          updateSearch({ gasBuckets: sorted.length > 0 ? sorted.map((v) => String(v / 1_000_000)).join(',') : undefined })
+                          updateFilterSearch({ gasBuckets: sorted.length > 0 ? sorted.map((v) => String(v / 1_000_000)).join(',') : undefined })
                         }}
                         className={clsx(
                           'rounded-xs px-2 py-0.5 text-xs/5 font-medium transition-colors',
@@ -639,6 +681,12 @@ export function CompareGroupsPage() {
               </div>
             )}
           </div>
+
+          <FacetPanel
+            testNames={[...testGasMap.keys()]}
+            query={testFilter}
+            onToggle={(term) => updateFilterSearch({ filter: toggleSearchTerm(testFilter, term) || undefined })}
+          />
 
           <MetricsComparison
             runs={syntheticRuns}
@@ -670,7 +718,7 @@ export function CompareGroupsPage() {
               onBaselineChange={(idx) => updateSearch({ baseline: idx > 0 ? String(idx) : undefined })}
               labelMode="instance-id"
               diffFilter={search.diffFilter === 'faster' || search.diffFilter === 'slower' ? search.diffFilter : 'all'}
-              onDiffFilterChange={(val) => updateSearch({ diffFilter: val === 'all' ? undefined : val })}
+              onDiffFilterChange={(val) => updateFilterSearch({ diffFilter: val === 'all' ? undefined : val })}
               testNameFilter={testNameFilter}
               zoomRange={sharedZoom ? chartZoom : undefined}
               onZoomChange={sharedZoom ? setChartZoom : undefined}
@@ -699,6 +747,17 @@ export function CompareGroupsPage() {
             zoomRange={sharedZoom ? chartZoom : undefined}
             onZoomChange={sharedZoom ? setChartZoom : undefined}
             chartType={chartType}
+            onTestClick={setSelectedTest}
+          />
+
+          <CompareDimensionInsights
+            runs={syntheticRuns}
+            stepFilter={stepFilter}
+            baselineIdx={baselineIdx}
+            labelMode="instance-id"
+            testNameFilter={testNameFilter}
+            query={testFilter}
+            onToggle={(term) => updateFilterSearch({ filter: toggleSearchTerm(testFilter, term) || undefined })}
             onTestClick={setSelectedTest}
           />
 
@@ -735,6 +794,8 @@ export function CompareGroupsPage() {
           groupRunIds={groupRuns}
           stepFilter={stepFilter}
           sampleSize={sampleSize}
+          searchQuery={testFilter}
+          onChipFilterToggle={(term) => updateFilterSearch({ filter: toggleSearchTerm(testFilter, term) || undefined })}
           onClose={() => setSelectedTest(null)}
         />
       )}

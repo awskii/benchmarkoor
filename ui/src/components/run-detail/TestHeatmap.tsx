@@ -5,6 +5,8 @@ import { Check, Copy, Download } from 'lucide-react'
 import type { TestEntry, SuiteTest, AggregatedStats, MethodsAggregated, StepResult, PostTestRPCCallConfig } from '@/api/types'
 import { fetchHead } from '@/api/client'
 import { Modal } from '@/components/shared/Modal'
+import { TestName } from '@/components/shared/TestName'
+import { compileQuery, testNameMatches, toggleSearchTerm } from '@/utils/eestNameFilter'
 import { TimeBreakdown } from './TimeBreakdown'
 import { MGasBreakdown } from './MGasBreakdown'
 import { ExecutionsList } from './ExecutionsList'
@@ -13,7 +15,9 @@ import type { TestStatusFilter } from './TestsTable'
 import { type StepTypeOption, ALL_STEP_TYPES } from '@/pages/RunDetailPage'
 import { formatDuration, formatBytes } from '@/utils/format'
 import { EESTInfoContent, type OpcodeSortMode } from '@/components/suite-detail/TestFilesList'
+import { OpcodeDiffPanel, type OpcodeDiffRow } from './OpcodeDiffPanel'
 import { useBlockLogs } from '@/api/hooks/useBlockLogs'
+import { DEFAULT_THRESHOLD, THRESHOLD_COLORS, getColorByThreshold } from '@/utils/perfThreshold'
 
 // Aggregate stats from selected steps of a test entry
 function getAggregatedStats(entry: TestEntry, stepFilter: StepTypeOption[] = ALL_STEP_TYPES): AggregatedStats | undefined {
@@ -100,6 +104,13 @@ function formatGasGroup(gasGroup: number): string {
 interface TestHeatmapProps {
   tests: Record<string, TestEntry>
   suiteTests?: SuiteTest[]
+  /**
+   * Per-test opcode diffs between this run's extracted counts and the
+   * suite-defined counts. When the selected test has an entry, a
+   * compact diff table is rendered inside its modal. Caller (the run
+   * detail page) computes this from useRunOpcodes + suite.tests.
+   */
+  opcodeDiffByTest?: Record<string, OpcodeDiffRow[]>
   runId: string
   suiteHash?: string
   selectedTest?: string
@@ -118,25 +129,12 @@ interface TestHeatmapProps {
   onSelectedTestChange?: (testName: string | undefined) => void
   onSortModeChange?: (mode: SortMode) => void
   onGroupModeChange?: (mode: GroupMode) => void
-  onThresholdChange?: (threshold: number) => void
   onSearchChange?: (query: string) => void
   activeStepTab?: 'test' | 'setup' | 'cleanup'
   onActiveStepTabChange?: (tab: 'test' | 'setup' | 'cleanup') => void
   expandedExecRows?: Set<number>
   onExpandedExecRowsChange?: (rows: Set<number>) => void
 }
-
-const COLORS = [
-  '#22c55e', // green - best (highest MGas/s)
-  '#84cc16', // lime
-  '#eab308', // yellow
-  '#f97316', // orange
-  '#ef4444', // red - worst (lowest MGas/s)
-]
-
-const MIN_THRESHOLD = 10
-const MAX_THRESHOLD = 1000
-const DEFAULT_THRESHOLD = 60
 
 function calculateMGasPerSec(gasUsedTotal: number, gasUsedTimeTotal: number): number | undefined {
   if (gasUsedTimeTotal <= 0 || gasUsedTotal <= 0) return undefined
@@ -161,17 +159,6 @@ function CopyButton({ text }: { text: string }) {
       {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
     </button>
   )
-}
-
-function getColorByThreshold(value: number, threshold: number): string {
-  // Scale: 0 = threshold (yellow), >threshold = green, <threshold = red
-  // Range: 0 to 2*threshold maps to full color scale
-  const ratio = value / threshold
-  if (ratio >= 2) return COLORS[0] // Very fast - green
-  if (ratio >= 1.5) return COLORS[1] // Fast - lime
-  if (ratio >= 1) return COLORS[2] // At threshold - yellow
-  if (ratio >= 0.5) return COLORS[3] // Slow - orange
-  return COLORS[4] // Very slow - red
 }
 
 interface TestData {
@@ -302,7 +289,7 @@ function HeatmapCell({
     // ran-and-failed tests cleanly.
     (!test.notProcessed && statusFilter === 'passed' && !test.hasFail) ||
     (!test.notProcessed && statusFilter === 'failed' && test.hasFail)
-  const matchesSearchQuery = !searchQuery || test.testKey.toLowerCase().includes(searchQuery.toLowerCase())
+  const matchesSearchQuery = !searchQuery || testNameMatches(test.testKey, searchQuery)
   const matchesFilter = matchesStatusFilter && matchesSearchQuery
   let baseStyle: React.CSSProperties
   if (test.notProcessed) {
@@ -343,9 +330,18 @@ function HeatmapCell({
   )
 }
 
+function TooltipFilename({ name }: { name: string }) {
+  return (
+    <div className="w-96 max-w-[80vw]">
+      <TestName name={name} />
+    </div>
+  )
+}
+
 export function TestHeatmap({
   tests,
   suiteTests,
+  opcodeDiffByTest,
   runId,
   suiteHash,
   selectedTest,
@@ -358,9 +354,9 @@ export function TestHeatmap({
   postTestRPCCalls,
   inProgressTestKey,
   onSelectedTestChange,
+  onSearchChange,
   onSortModeChange,
   onGroupModeChange,
-  onThresholdChange,
   activeStepTab: activeStepTabProp,
   onActiveStepTabChange,
   expandedExecRows,
@@ -392,12 +388,6 @@ export function TestHeatmap({
 
   const handleGroupModeChange = (mode: GroupMode) => {
     onGroupModeChange?.(mode)
-  }
-
-  const handleThresholdChange = (value: number) => {
-    if (value >= MIN_THRESHOLD && value <= MAX_THRESHOLD) {
-      onThresholdChange?.(value)
-    }
   }
 
   const executionOrder = useMemo(() => {
@@ -569,8 +559,24 @@ export function TestHeatmap({
       }))
   }, [sortedData, groupMode])
 
+  // Distribution / above-threshold / below-threshold counts respect the
+  // page-level status + search filter so the histogram reflects what the
+  // user is actually looking at on the heatmap.
+  const filteredTestData = useMemo(() => {
+    const matchesQuery = searchQuery ? compileQuery(searchQuery) : null
+    return testData.filter((t) => {
+      if (statusFilter !== 'all') {
+        if (t.notProcessed) return false
+        if (statusFilter === 'passed' && t.hasFail) return false
+        if (statusFilter === 'failed' && !t.hasFail) return false
+      }
+      if (matchesQuery && !matchesQuery(t.testKey)) return false
+      return true
+    })
+  }, [testData, statusFilter, searchQuery])
+
   const histogramData = useMemo(() => {
-    const testsWithData = testData.filter((t) => !t.noData)
+    const testsWithData = filteredTestData.filter((t) => !t.noData)
     if (testsWithData.length === 0) return []
 
     // Create bins based on threshold: 0, 0.25x, 0.5x, 0.75x, 1x, 1.25x, 1.5x, 1.75x, 2x, 2.5x, 3x+
@@ -606,13 +612,25 @@ export function TestHeatmap({
         color: getColorByThreshold(midpoint, threshold),
       }
     })
-  }, [testData, threshold])
+  }, [filteredTestData, threshold])
 
   const handleMouseEnter = (test: TestData, event: React.MouseEvent) => {
     const rect = event.currentTarget.getBoundingClientRect()
+    // Clamp the tooltip x so it stays within the viewport even when hovering
+    // tiles at the left or right edge. The tooltip is `w-96 max-w-[80vw]` and
+    // is rendered with `translate(-50%, -100%)`, so the center must sit at
+    // least halfWidth + margin from each edge.
+    const tooltipWidth = Math.min(384, window.innerWidth * 0.8)
+    const halfWidth = tooltipWidth / 2
+    const margin = 8
+    const desired = rect.left + rect.width / 2
+    const clampedX = Math.max(
+      halfWidth + margin,
+      Math.min(window.innerWidth - halfWidth - margin, desired),
+    )
     setTooltip({
       test,
-      x: rect.left + rect.width / 2,
+      x: clampedX,
       y: rect.top,
     })
   }
@@ -703,34 +721,6 @@ export function TestHeatmap({
               </button>
             </div>
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs/5 text-gray-500 dark:text-gray-400">Slow threshold:</span>
-            <input
-              type="range"
-              min={MIN_THRESHOLD}
-              max={MAX_THRESHOLD}
-              value={threshold}
-              onChange={(e) => handleThresholdChange(Number(e.target.value))}
-              className="h-1.5 w-24 cursor-pointer appearance-none rounded-full bg-gray-200 accent-blue-500 dark:bg-gray-700"
-            />
-            <input
-              type="number"
-              min={MIN_THRESHOLD}
-              max={MAX_THRESHOLD}
-              value={threshold}
-              onChange={(e) => handleThresholdChange(Number(e.target.value))}
-              className="w-16 rounded-sm border border-gray-300 bg-white px-1.5 py-0.5 text-center text-xs/5 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-            />
-            <span className="text-xs/5 text-gray-500 dark:text-gray-400">MGas/s</span>
-            {threshold !== DEFAULT_THRESHOLD && (
-              <button
-                onClick={() => handleThresholdChange(DEFAULT_THRESHOLD)}
-                className="text-xs/5 text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
-              >
-                Reset
-              </button>
-            )}
-          </div>
         </div>
         <div className="text-xs/5 text-gray-500 dark:text-gray-400">
           {(() => {
@@ -802,7 +792,7 @@ export function TestHeatmap({
         <div className="flex items-end gap-1">
           <div className="flex h-16 w-8 shrink-0 flex-col items-center justify-end">
             <span className="text-xs/5 font-medium text-red-600 dark:text-red-400">
-              {testData.filter((t) => !t.noData && t.mgasPerSec < threshold).length}
+              {filteredTestData.filter((t) => !t.noData && t.mgasPerSec < threshold).length}
             </span>
             <span className="text-xs/5 text-gray-400 dark:text-gray-500">slow</span>
           </div>
@@ -828,7 +818,7 @@ export function TestHeatmap({
           </div>
           <div className="flex h-16 w-8 shrink-0 flex-col items-center justify-end">
             <span className="text-xs/5 font-medium text-green-600 dark:text-green-400">
-              {testData.filter((t) => !t.noData && t.mgasPerSec >= threshold).length}
+              {filteredTestData.filter((t) => !t.noData && t.mgasPerSec >= threshold).length}
             </span>
             <span className="text-xs/5 text-gray-400 dark:text-gray-500">fast</span>
           </div>
@@ -845,7 +835,7 @@ export function TestHeatmap({
         <span className="flex items-center gap-1">
           <span>&gt;{threshold * 2}</span>
           <span className="flex gap-0.5">
-            {COLORS.map((color, i) => (
+            {THRESHOLD_COLORS.map((color, i) => (
               <span key={i} className="size-3 rounded-xs" style={{ backgroundColor: color }} />
             ))}
           </span>
@@ -861,7 +851,7 @@ export function TestHeatmap({
           Not processed
         </span>
         <span>
-          <span className="mr-1 inline-block size-3 rounded-xs ring-1 ring-red-500" style={{ backgroundColor: COLORS[2] }} />
+          <span className="mr-1 inline-block size-3 rounded-xs ring-1 ring-red-500" style={{ backgroundColor: THRESHOLD_COLORS[2] }} />
           Has failures
         </span>
       </div>
@@ -896,7 +886,7 @@ export function TestHeatmap({
               </>
             )}
             <div className="text-gray-500 dark:text-gray-400">Based on steps: {stepFilter.join(', ')}</div>
-            <div className="w-48 break-all text-gray-500 dark:text-gray-400">{tooltip.test.filename}</div>
+            <TooltipFilename name={tooltip.test.filename} />
             {tooltip.test.notProcessed ? (
               <div className="text-gray-500 dark:text-gray-400">Test was not run</div>
             ) : tooltip.test.noData ? (
@@ -925,10 +915,15 @@ export function TestHeatmap({
             <div className="flex flex-col gap-6">
               <div className="flex flex-col gap-2">
                 <div>
-                  <div className="text-xs/5 font-medium text-gray-500 dark:text-gray-400">Test Name</div>
-                  <div className="flex items-center gap-2 text-sm/6 text-gray-900 dark:text-gray-100">
-                    <span className="min-w-0 break-all">{selectedTest}</span>
-                    <CopyButton text={selectedTest} />
+                  <div className="text-sm/6 text-gray-900 dark:text-gray-100">
+                    <TestName
+                      name={selectedTest}
+                      showRawBelow
+                      showCopy
+                      onChipClick={onSearchChange ? (term) => onSearchChange(toggleSearchTerm(searchQuery, term)) : undefined}
+                      activeQuery={searchQuery}
+                      className="min-w-0"
+                    />
                   </div>
                 </div>
                 {entry.dir && (
@@ -954,6 +949,25 @@ export function TestHeatmap({
                 const matchingSuiteTest = suiteTests?.find((t) => t.name === selectedTest)
                 if (!matchingSuiteTest) return null
                 return <EESTInfoContent test={matchingSuiteTest} opcodeSort={opcodeSort} onOpcodeSortChange={setOpcodeSort} />
+              })()}
+              {(() => {
+                const diffRows = opcodeDiffByTest?.[selectedTest]
+                if (!diffRows || diffRows.length === 0) return null
+                return (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center gap-2 text-xs/5 text-yellow-800 dark:text-yellow-200">
+                      <span className="inline-flex items-center rounded-xs bg-yellow-100 px-1.5 py-0.5 font-medium dark:bg-yellow-900/50">
+                        ⚠ Opcode counts differ from suite
+                      </span>
+                      <span className="text-gray-500 dark:text-gray-400">
+                        {diffRows.length} opcode{diffRows.length === 1 ? '' : 's'} with non-zero Δ; sorted by absolute delta
+                      </span>
+                    </div>
+                    <div className="max-h-72 overflow-y-auto rounded-xs border border-gray-200 bg-white p-2 dark:border-gray-700 dark:bg-gray-900">
+                      <OpcodeDiffPanel rows={diffRows} />
+                    </div>
+                  </div>
+                )
               })()}
               {blockLogs?.[selectedTest] && (
                 <BlockLogDetails blockLog={blockLogs[selectedTest]} />

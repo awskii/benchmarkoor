@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import clsx from 'clsx'
 import { type CompareRun, type LabelMode, buildLabelModeOptions, RUN_SLOTS, formatRunLabel } from './constants'
 import { FilterInput } from '@/components/shared/FilterInput'
+import { TEST_FILTER_HINT } from '@/utils/eestNameFilter'
 
 interface StickyRunBarProps {
   runs: CompareRun[]
@@ -76,11 +77,12 @@ export function StickyRunBar({ runs, sentinelRef, labelMode, onLabelModeChange, 
         <div className="flex items-center gap-1.5">
           <span>Filter:</span>
           <FilterInput
-            placeholder={testFilterRegex ? 'Regex...' : 'Filter...'}
+            placeholder={testFilterRegex ? 'Regex...' : 'Filter or e.g. opcode:ORIGIN'}
+            title={testFilterRegex ? 'Regex against the raw test name.' : TEST_FILTER_HINT}
             value={testFilter}
             onValueChange={onTestFilterChange}
             className={clsx(
-              'w-36 rounded-xs border bg-white px-2 py-0.5 text-xs/5 placeholder-gray-400 focus:outline-hidden focus:ring-1 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-500',
+              'w-80 rounded-xs border bg-white px-2 py-0.5 text-xs/5 placeholder-gray-400 focus:outline-hidden focus:ring-1 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-500',
               testFilterRegex && testFilter && (() => { try { new RegExp(testFilter); return false } catch { return true } })()
                 ? 'border-red-400 focus:border-red-500 focus:ring-red-500 dark:border-red-500'
                 : 'border-gray-300 focus:border-blue-500 focus:ring-blue-500 dark:border-gray-600',

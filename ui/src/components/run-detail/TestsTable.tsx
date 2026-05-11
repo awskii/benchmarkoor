@@ -5,6 +5,8 @@ import type { TestEntry, SuiteTest, AggregatedStats, StepResult } from '@/api/ty
 import { Badge } from '@/components/shared/Badge'
 import { Duration } from '@/components/shared/Duration'
 import { Pagination } from '@/components/shared/Pagination'
+import { TestName } from '@/components/shared/TestName'
+import { compileQuery, toggleSearchTerm } from '@/utils/eestNameFilter'
 import { type StepTypeOption, ALL_STEP_TYPES } from '@/pages/RunDetailPage'
 
 export type TestSortColumn = 'order' | 'name' | 'genesis' | 'time' | 'mgas' | 'passed' | 'failed'
@@ -176,8 +178,8 @@ export function TestsTable({
     let filtered = Object.entries(tests)
 
     if (searchQuery) {
-      const query = searchQuery.toLowerCase()
-      filtered = filtered.filter(([name]) => name.toLowerCase().includes(query))
+      const match = compileQuery(searchQuery)
+      filtered = filtered.filter(([name]) => match(name))
     }
 
     // Genesis filter
@@ -234,12 +236,6 @@ export function TestsTable({
 
   const totalPages = Math.ceil(sortedTests.length / pageSize)
   const paginatedTests = sortedTests.slice((currentPage - 1) * pageSize, currentPage * pageSize)
-
-  const handleSearchInput = (value: string) => {
-    if (onSearchChange) {
-      onSearchChange(value)
-    }
-  }
 
   const handlePageSizeChange = (newSize: number) => {
     if (onPageSizeChange) {
@@ -306,13 +302,6 @@ export function TestsTable({
               ))}
             </select>
           )}
-          <input
-            type="text"
-            placeholder="Search tests..."
-            value={searchQuery}
-            onChange={(e) => handleSearchInput(e.target.value)}
-            className="w-64 rounded-sm border border-gray-300 bg-white px-3 py-2 text-sm/6 placeholder:text-gray-400 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 dark:placeholder:text-gray-500"
-          />
         </div>
       </div>
 
@@ -357,9 +346,12 @@ export function TestsTable({
                     {executionOrder.get(testName) ?? '-'}
                   </td>
                   <td className="max-w-md px-4 py-3">
-                    <div className="truncate text-sm/6 font-medium text-gray-900 dark:text-gray-100" title={testName}>
-                      {testName}
-                    </div>
+                    <TestName
+                      name={testName}
+                      onChipClick={onSearchChange ? (term) => onSearchChange(toggleSearchTerm(searchQuery, term)) : undefined}
+                      activeQuery={searchQuery}
+                      className="text-sm/6 font-medium text-gray-900 dark:text-gray-100"
+                    />
                     {entry.dir && (
                       <div className="truncate text-xs/5 text-gray-500 dark:text-gray-400" title={entry.dir}>
                         {entry.dir}

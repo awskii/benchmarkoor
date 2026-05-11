@@ -272,6 +272,20 @@ export interface WarmupTestPayloadConfig {
   method?: string
 }
 
+export interface OpcodeExtractionConfig {
+  enabled: boolean
+  timeout?: string
+}
+
+/**
+ * Shape of the per-run `test-opcodes.json` written when
+ * `opcode_extraction.enabled` is true. One entry per test name; each
+ * entry is an array with one map per `engine_newPayload*` in that test
+ * (per-tx counts are summed and the opcode names are uppercased).
+ */
+export type RunTestOpcodes = Record<string, Array<Record<string, number>>>
+
+
 export interface InstanceConfig {
   id: string
   client: string
@@ -299,6 +313,7 @@ export interface InstanceConfig {
   post_test_sleep_duration?: string
   checkpoint_restore_strategy_options?: CheckpointRestoreStrategyOptions
   warmup_test_payload?: WarmupTestPayloadConfig
+  opcode_extraction?: OpcodeExtractionConfig
 }
 
 // result.json per run

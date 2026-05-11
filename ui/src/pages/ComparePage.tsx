@@ -1,15 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react'
 import clsx from 'clsx'
 import { Link, useSearch, useNavigate } from '@tanstack/react-router'
 import { useQueries } from '@tanstack/react-query'
 import { type IndexStepType, ALL_INDEX_STEP_TYPES } from '@/api/types'
 import type { BlockLogs, RunConfig, RunResult } from '@/api/types'
 import { fetchData } from '@/api/client'
+import { testNameMatches, toggleSearchTerm, TEST_FILTER_HINT } from '@/utils/eestNameFilter'
 import { useSuite } from '@/api/hooks/useSuite'
 import { LoadingState } from '@/components/shared/Spinner'
 import { ErrorState } from '@/components/shared/ErrorState'
 import { JDenticon } from '@/components/shared/JDenticon'
 import { FilterInput } from '@/components/shared/FilterInput'
+import { FacetPanel } from '@/components/shared/FacetPanel'
+import { CompareDimensionInsights } from '@/components/compare/CompareDimensionInsights'
 import { CompareHeader } from '@/components/compare/CompareHeader'
 import { StickyRunBar } from '@/components/compare/StickyRunBar'
 import { MetricsComparison } from '@/components/compare/MetricsComparison'
@@ -181,8 +184,7 @@ export function ComparePage() {
           return undefined
         }
       }
-      const q = testFilter.toLowerCase()
-      return (name: string) => name.toLowerCase().includes(q)
+      return (name: string) => testNameMatches(name, testFilter)
     })()
 
     const gasFn = selectedGasBuckets.size > 0
@@ -223,21 +225,33 @@ export function ComparePage() {
   const setDiffFilter = useCallback((val: 'all' | 'faster' | 'slower') => {
     updateSearch({ diffFilter: val === 'all' ? undefined : val })
   }, [updateSearch])
+  // Filter changes fan out into many synchronous re-renders (charts, table,
+  // facet panel, dimension insights). Wrapping the URL update in
+  // `startTransition` marks the resulting work as interruptible so chip
+  // clicks and keystrokes feel instant even when the downstream work takes
+  // hundreds of ms.
+  const [, startFilterTransition] = useTransition()
   const setTestFilter = useCallback((query: string) => {
-    updateSearch({ filter: query || undefined })
+    startFilterTransition(() => {
+      updateSearch({ filter: query || undefined })
+    })
   }, [updateSearch])
   const setTestFilterRegex = useCallback((enabled: boolean) => {
-    updateSearch({ filterRegex: enabled ? '1' : undefined })
+    startFilterTransition(() => {
+      updateSearch({ filterRegex: enabled ? '1' : undefined })
+    })
   }, [updateSearch])
 
   const setGasBuckets = useCallback(
     (buckets: Set<number>) => {
-      if (buckets.size === 0) {
-        updateSearch({ gasBuckets: undefined })
-      } else {
-        const sorted = [...buckets].sort((a, b) => a - b)
-        updateSearch({ gasBuckets: sorted.map((v) => String(v / 1_000_000)).join(',') })
-      }
+      startFilterTransition(() => {
+        if (buckets.size === 0) {
+          updateSearch({ gasBuckets: undefined })
+        } else {
+          const sorted = [...buckets].sort((a, b) => a - b)
+          updateSearch({ gasBuckets: sorted.map((v) => String(v / 1_000_000)).join(',') })
+        }
+      })
     },
     [updateSearch],
   )
@@ -375,7 +389,8 @@ export function ComparePage() {
         <div className="flex items-center gap-1.5">
           <span>Filter:</span>
           <FilterInput
-            placeholder={testFilterRegex ? 'Regex pattern...' : 'Filter tests...'}
+            placeholder={testFilterRegex ? 'Regex pattern...' : 'Filter… or e.g. opcode:ORIGIN'}
+            title={testFilterRegex ? 'Regex against the raw test name.' : TEST_FILTER_HINT}
             value={testFilter}
             onValueChange={setTestFilter}
             className={clsx(
@@ -448,6 +463,12 @@ export function ComparePage() {
         }} />
       </div>
 
+      <FacetPanel
+        testNames={[...testGasMap.keys()]}
+        query={testFilter}
+        onToggle={(term) => setTestFilter(toggleSearchTerm(testFilter, term))}
+      />
+
       <MetricsComparison runs={runs} stepFilter={stepFilter} baselineIdx={baselineIdx} onBaselineChange={setBaselineIdx} labelMode={labelMode} testNameFilter={testNameFilter} />
 
       {allResults && (
@@ -462,8 +483,18 @@ export function ComparePage() {
 
       {allResults && <ResourceComparisonCharts runs={runs} labelMode={labelMode} testNameFilter={testNameFilter} suiteTests={suite?.tests} zoomRange={sharedZoom ? chartZoom : undefined} onZoomChange={sharedZoom ? setChartZoom : undefined} chartType={chartType} />}
 
+      <CompareDimensionInsights
+        runs={runs}
+        stepFilter={stepFilter}
+        baselineIdx={baselineIdx}
+        labelMode={labelMode}
+        testNameFilter={testNameFilter}
+        query={testFilter}
+        onToggle={(term) => setTestFilter(toggleSearchTerm(testFilter, term))}
+      />
+
       {allResults && (
-        <TestComparisonTable runs={runs} suiteTests={suite?.tests} stepFilter={stepFilter} blockLogsPerRun={blockLogsPerRun} labelMode={labelMode} tableBaseline={tableBaseline} onTableBaselineChange={setTableBaseline} sortBy={tableSortBy} sortDir={tableSortDir} onSortChange={setTableSort} testNameFilter={testNameFilter} />
+        <TestComparisonTable runs={runs} suiteTests={suite?.tests} stepFilter={stepFilter} blockLogsPerRun={blockLogsPerRun} labelMode={labelMode} tableBaseline={tableBaseline} onTableBaselineChange={setTableBaseline} sortBy={tableSortBy} sortDir={tableSortDir} onSortChange={setTableSort} testNameFilter={testNameFilter} searchQuery={testFilter} onChipFilterToggle={(term) => setTestFilter(toggleSearchTerm(testFilter, term))} />
       )}
 
       <ConfigDiff runs={runs} labelMode={labelMode} />

@@ -168,6 +168,9 @@ func (m *manager) Start(ctx context.Context) error {
 	}
 
 	m.log.Debug("Connected to Docker daemon")
+	m.log.WithField("nofile", HostMaxNofile()).Info(
+		"Container RLIMIT_NOFILE bumped to host kernel max",
+	)
 
 	return nil
 }
@@ -253,11 +256,20 @@ func (m *manager) CreateContainer(ctx context.Context, spec *ContainerSpec) (str
 		Cmd:        spec.Command,
 	}
 
+	// Bump RLIMIT_NOFILE to the kernel's hard ceiling so EL clients
+	// don't trip "too many open files" errors during long benchmark
+	// runs. Applied to every container we create. Ulimits lives on the
+	// embedded Resources struct, so it has to be set after the literal.
+	nofile := int64(HostMaxNofile()) //nolint:gosec // bounded by kernel nr_open, fits in int64.
+
 	hostCfg := &container.HostConfig{
 		Mounts:      mounts,
 		NetworkMode: container.NetworkMode(spec.NetworkName),
 		CapAdd:      spec.CapAdd,
 		SecurityOpt: spec.SecurityOpt,
+	}
+	hostCfg.Ulimits = []*container.Ulimit{
+		{Name: "nofile", Hard: nofile, Soft: nofile},
 	}
 
 	// Apply resource limits if configured.

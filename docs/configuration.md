@@ -250,7 +250,7 @@ runner:
 | `generate_results_index_method` | string | `local` | Method for index generation: `local` (filesystem) or `s3` (read runs from S3, upload index back). Requires `results_upload.s3` when set to `s3` |
 | `generate_suite_stats` | bool | `false` | Generate `stats.json` per suite for UI heatmaps |
 | `generate_suite_stats_method` | string | `local` | Method for suite stats generation: `local` (filesystem) or `s3` (read runs from S3, upload stats back). Requires `results_upload.s3` when set to `s3` |
-| `tests.filter` | string | - | Run only tests matching this pattern |
+| `tests.filter` | string | - | Run only tests whose name (or file path) matches this pattern. Plain values match by substring; values prefixed with `regex:` match the trailing expression as a Go regular expression. See [Test Filter](#test-filter) |
 | `tests.metadata.labels` | map[string]string | - | Arbitrary key-value labels for the test suite (see [Suite Metadata Labels](#suite-metadata-labels)) |
 | `tests.source` | object | - | Test source configuration (see below) |
 
@@ -424,16 +424,16 @@ EEST (Ethereum Execution Spec Tests) fixtures can be loaded from GitHub releases
 ```yaml
 tests:
   source:
-    eest_fixtures:
-      github_repo: ethereum/execution-spec-tests
-      github_release: benchmark@v0.0.7
+      eest_fixtures:
+        github_repo: ethereum/execution-specs
+        github_release: tests-benchmark@v0.0.9
       fixtures_subdir: fixtures/blockchain_tests_engine_x
 ```
 
 | Option | Type | Required | Default | Description |
 |--------|------|----------|---------|-------------|
-| `github_repo` | string | Yes | - | GitHub repository (e.g., `ethereum/execution-spec-tests`) |
-| `github_release` | string | Yes* | - | Release tag (e.g., `benchmark@v0.0.7`) |
+| `github_repo` | string | Yes | - | GitHub repository (e.g., `ethereum/execution-specs`) |
+| `github_release` | string | Yes* | - | Release tag (e.g., `test-benchmark@v0.0.9`) |
 | `fixtures_subdir` | string | No | `fixtures/blockchain_tests_engine_x` | Subdirectory within the fixtures tarball to search |
 | `fixtures_url` | string | No | Auto-generated | Override URL for fixtures tarball |
 | `genesis_url` | string | No | Auto-generated | Override URL for genesis tarball |
@@ -543,9 +543,41 @@ runner:
       filter: "bn128"  # Only run tests matching "bn128"
       source:
         eest_fixtures:
-          github_repo: ethereum/execution-spec-tests
-          github_release: benchmark@v0.0.7
+          github_repo: ethereum/execution-specs
+          github_release: tests-benchmark@v0.0.9
 ```
+
+#### Test Filter
+
+The `runner.benchmark.tests.filter` selects which tests run. Two modes:
+
+| Mode | Syntax | Behavior |
+|------|--------|----------|
+| Substring (default) | `filter: "bn128"` | Test/file path must contain the literal string. Regex metacharacters are matched literally (e.g. `filter: "test.*name"` only matches paths that contain the seven-character string `test.*name`) |
+| Regex | `filter: "regex:<expr>"` | The trailing expression is compiled as a [Go regular expression](https://pkg.go.dev/regexp/syntax) and tested with `MatchString`. Anchor with `^` / `$` if you need full-string matches; flags like `(?i)` for case-insensitive are supported |
+
+Examples:
+
+```yaml
+# Substring — matches any test path containing "keccak"
+filter: "keccak"
+
+# Regex — matches "test_sstore_bloated…benchmark_300M" anywhere in the path
+filter: "regex:test_sstore_bloated.*benchmark_300M"
+
+# Regex with case-insensitive flag
+filter: "regex:(?i)KECCAK|sha256"
+
+# Regex anchored to end of path
+filter: "regex:bn128_pairing\\.txt$"
+```
+
+The filter is applied to:
+- file paths returned from glob expansion (substring match against the absolute path),
+- EEST fixture test names,
+- opcode source entries.
+
+A bad regex (e.g. unclosed character class) is rejected at config-load time with a `runner.benchmark.tests.filter: invalid regex …` error.
 
 #### Results Upload
 
@@ -658,6 +690,7 @@ runner:
 | `post_test_sleep_duration` | string | - | Sleep duration after each test, e.g. `200ms`, `1s` (see below) |
 | `bootstrap_fcu` | bool/object | - | Send an `engine_forkchoiceUpdatedV3` after RPC is ready to confirm the client is fully synced (see [Bootstrap FCU](#bootstrap-fcu)) |
 | `warmup_test_payload` | object | - | Insert a warmup phase between setup and test that sends modified `engine_newPayload*` calls (stateRoot replaced, blockHash recomputed) to warm caches (see [Warmup Test Payload](#warmup-test-payload)) |
+| `opcode_extraction` | object | - | Extract per-test opcode counts via `debug_traceBlockByNumber` after each test step (see [Opcode Extraction](#opcode-extraction)) |
 | `genesis` | map | - | Genesis file URLs keyed by client type |
 
 ##### Drop Memory Caches
@@ -977,6 +1010,44 @@ Warmup steps reuse the test step's lines as the source. Non-`engine_newPayload*`
 - When you want to measure the client's "hot" performance and the existing setup phase doesn't fully populate caches
 - When investigating cold-start regressions by comparing warmup-on vs warmup-off runs
 
+##### Opcode Extraction
+
+The `opcode_extraction` option captures per-test opcode counts as a side effect of running tests. After each test step, the runner walks the test's `engine_newPayload*` calls and runs `debug_traceBlockByNumber` against each block with a JS opcode-counting tracer. Per-tx counts are summed (and uppercased) into one map per newPayload, then appended to a per-test array. At the end of the run all the data lands in a single `test-opcodes.json` at the run results dir, in the same shape that `runner.benchmark.tests.opcode_source` expects.
+
+```yaml
+runner:
+  client:
+    config:
+      opcode_extraction:
+        enabled: true
+        timeout: 2m   # per-block trace timeout; default 2m
+```
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `enabled` | bool | Yes | `false` | Enable the post-test extraction step |
+| `timeout` | string | No | `2m` | Per-block `debug_traceBlockByNumber` timeout (Go duration). Long traces on fat blocks may need a higher value |
+
+`opcode_extraction` can be set globally under `runner.client.config` and/or per-instance under `runner.instances[]`. Instance-level config (when non-nil) fully replaces the global default. The output file shape is:
+
+```json
+{
+  "test-name.txt": [
+    { "PUSH1": 23432, "DUP1": 11231, "SSTORE": 3321 }
+  ]
+}
+```
+
+(One entry per `engine_newPayload*` in the test step, summed across all txs in that block.)
+
+**Requirements:**
+- The client must accept JS tracers via `debug_traceBlockByNumber`. Geth, Erigon, and Nethermind support them; coverage on Reth/Besu/Nimbus/ethrex varies — check your client docs.
+- The trace runs against the EL state right after the test step, before rollback, so the client must still have the block.
+
+**When to use:**
+- When you want a ground-truth opcode profile of every benchmarked test (instead of relying on `opcode_source` JSON shipped from a separate pipeline)
+- When investigating client-vs-client divergence in EVM execution paths
+
 #### Data Directories
 
 The `runner.client.datadirs` section configures pre-populated data directories per client type. When configured, the init container is skipped and data is mounted directly.
@@ -1087,6 +1158,7 @@ runner:
 | `post_test_sleep_duration` | string | No | From `runner.client.config` | Instance-specific post-test sleep duration |
 | `bootstrap_fcu` | bool/object | No | From `runner.client.config` | Instance-specific bootstrap FCU setting |
 | `warmup_test_payload` | object | No | From `runner.client.config` | Instance-specific warmup test payload setting (replaces global) |
+| `opcode_extraction` | object | No | From `runner.client.config` | Instance-specific opcode extraction setting (replaces global) |
 
 ## Resource Limits
 
@@ -1376,8 +1448,8 @@ runner:
       filter: "bn128"  # Optional: filter tests by name
       source:
         eest_fixtures:
-          github_repo: ethereum/execution-spec-tests
-          github_release: benchmark@v0.0.7
+          github_repo: ethereum/execution-specs
+          github_release: tests-benchmark@v0.0.9
 
   client:
     config:

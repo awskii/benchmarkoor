@@ -112,6 +112,7 @@ type ExecuteOptions struct {
 	RetryNewPayloadsSyncingConfig *config.RetryNewPayloadsSyncingConfig // Retry config for SYNCING responses.
 	RetryNewPayloadsFailedConfig  *config.RetryNewPayloadsFailedConfig  // Retry config for any non-SYNCING newPayload failure (RPC error, validation error, INVALID status).
 	PostTestRPCCalls              []config.PostTestRPCCall              // Arbitrary RPC calls to execute after the test step.
+	OpcodeExtraction              *config.OpcodeExtractionConfig        // When enabled, run debug_traceBlockByNumber per newPayload after the test step and aggregate per-test opcode counts.
 	PostTestSleepDuration         time.Duration                         // Sleep duration after each test (0 = disabled).
 	FailFast                      bool                                  // If true, return an error from runStepLines on the first failed RPC call.
 	PreRunStepSleep               time.Duration                         // Sleep between each RPC call within pre-run step files (0 = disabled).
@@ -160,6 +161,7 @@ type executor struct {
 	suiteHash   string
 	validator   jsonrpc.Validator
 	statsReader stats.Reader
+	filter      *filterMatcher // compiled once from cfg.Filter
 
 	// Live progress counters updated during ExecuteTests. Safe to read
 	// concurrently via GetProgress().
@@ -174,6 +176,13 @@ type executor struct {
 	// Performance Heatmap that grows as tests complete.
 	liveTestsMu sync.RWMutex
 	liveTests   map[string]LiveTestStats
+
+	// Per-test aggregated opcode counts captured by extractTestOpcodes
+	// when opcode_extraction is enabled. The slice has one entry per
+	// engine_newPayload* in the test step, each entry summing per-tx
+	// counts across that block's transactions (uppercased).
+	opcodesMu   sync.Mutex
+	testOpcodes map[string][]map[string]int
 }
 
 // Ensure interface compliance.
@@ -181,7 +190,14 @@ var _ Executor = (*executor)(nil)
 
 // Start initializes the executor and prepares test sources.
 func (e *executor) Start(ctx context.Context) error {
-	e.source = NewSource(e.log, e.cfg.Source, e.cfg.CacheDir, e.cfg.Filter, e.cfg.GitHubToken)
+	filter, err := CompileFilter(e.cfg.Filter)
+	if err != nil {
+		return fmt.Errorf("compiling test filter: %w", err)
+	}
+
+	e.filter = filter
+
+	e.source = NewSource(e.log, e.cfg.Source, e.cfg.CacheDir, filter, e.cfg.GitHubToken)
 	if e.source == nil {
 		return fmt.Errorf("no test source configured")
 	}
@@ -653,6 +669,12 @@ func (e *executor) ExecuteTests(ctx context.Context, opts *ExecuteOptions) (*Exe
 			e.executePostTestRPCCalls(ctx, opts, test.Name, log)
 		}
 
+		// Extract per-newPayload opcode counts via debug_traceBlockByNumber.
+		// Best-effort: failures are logged but never abort the test.
+		if opts.OpcodeExtraction != nil && opts.OpcodeExtraction.Enabled && opts.RPCEndpoint != "" {
+			e.extractTestOpcodes(ctx, opts, test, log)
+		}
+
 		// Drop caches between test and cleanup.
 		if dropBetweenSteps && test.Test != nil && test.Cleanup != nil {
 			if err := e.dropMemoryCaches(dropCachesPath); err != nil {
@@ -785,6 +807,25 @@ writeResults:
 
 	if interrupted {
 		e.log.WithField("reason", interruptReason).Warn("Test execution was interrupted")
+	}
+
+	// Persist aggregated opcode counts (when extraction was enabled).
+	// This rewrites the file on every ExecuteTests call so multi-call
+	// strategies (container-recreate, checkpoint-restore) accumulate
+	// across calls without losing earlier tests.
+	e.opcodesMu.Lock()
+	opcodesSnapshot := make(map[string][]map[string]int, len(e.testOpcodes))
+	for k, v := range e.testOpcodes {
+		opcodesSnapshot[k] = v
+	}
+	e.opcodesMu.Unlock()
+
+	if len(opcodesSnapshot) > 0 {
+		if err := WriteTestOpcodes(opts.ResultsDir, opcodesSnapshot, e.cfg.ResultsOwner); err != nil {
+			e.log.WithError(err).Warn("Failed to write test-opcodes.json")
+		} else {
+			e.log.WithField("tests", len(opcodesSnapshot)).Info("Wrote test-opcodes.json")
+		}
 	}
 
 	return result, nil

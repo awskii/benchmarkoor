@@ -5,6 +5,7 @@ import { fetchHead } from '@/api/client'
 import type { TestEntry, AggregatedStats, StepResult } from '@/api/types'
 import { useRunConfig } from '@/api/hooks/useRunConfig'
 import { useRunResult } from '@/api/hooks/useRunResult'
+import { useRunOpcodes } from '@/api/hooks/useRunOpcodes'
 import { useSuite } from '@/api/hooks/useSuite'
 import { RunConfiguration } from '@/components/run-detail/RunConfiguration'
 import { MetadataLabels } from '@/components/run-detail/MetadataLabels'
@@ -15,6 +16,7 @@ import { TestsTable, type TestSortColumn, type TestSortDirection, type TestStatu
 import { PreRunStepsTable } from '@/components/run-detail/PreRunStepsTable'
 import { TestHeatmap, type SortMode, type GroupMode } from '@/components/run-detail/TestHeatmap'
 import { OpcodeHeatmap } from '@/components/suite-detail/OpcodeHeatmap'
+import { OpcodeDiffPanel, type OpcodeDiffRow } from '@/components/run-detail/OpcodeDiffPanel'
 import { LoadingState } from '@/components/shared/Spinner'
 import { ErrorState } from '@/components/shared/ErrorState'
 import { ClientStat } from '@/components/shared/ClientStat'
@@ -22,6 +24,10 @@ import { Duration } from '@/components/shared/Duration'
 import { JDenticon } from '@/components/shared/JDenticon'
 import { StatusAlert } from '@/components/shared/StatusBadge'
 import { FilterInput } from '@/components/shared/FilterInput'
+import { FacetPanel } from '@/components/shared/FacetPanel'
+import { DimensionInsights } from '@/components/run-detail/DimensionInsights'
+import { TEST_FILTER_HINT, toggleSearchTerm } from '@/utils/eestNameFilter'
+import { DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD } from '@/utils/perfThreshold'
 import { formatTimestamp, formatDurationSeconds } from '@/utils/date'
 import { formatNumber, formatBytes } from '@/utils/format'
 import { useIndex, useLiveRuns } from '@/api/hooks/useIndex'
@@ -34,6 +40,13 @@ import { Flame, Download, SquareStack, GitCompareArrows, Trash2 } from 'lucide-r
 import { MAX_COMPARE_RUNS, MIN_COMPARE_RUNS } from '@/components/compare/constants'
 import { useAuth } from '@/hooks/useAuth'
 import { useDeleteRuns } from '@/api/hooks/useAdmin'
+
+// Per-test opcode diff between this run and the suite. Only opcodes
+// where suite count != run count are listed.
+interface OpcodeTestDiff {
+  name: string
+  rows: OpcodeDiffRow[]
+}
 
 // Step types that can be included in MGas/s calculation
 export type StepTypeOption = 'setup' | 'test' | 'cleanup'
@@ -158,6 +171,7 @@ export function RunDetailPage() {
   const { data: config, isLoading: configLoading, error: configError, refetch: refetchConfig } = useRunConfig(runId, fetchOnDisk)
   const { data: result, isLoading: resultLoading, refetch: refetchResult } = useRunResult(runId, fetchOnDisk)
   const { data: suite } = useSuite(config?.suite_hash ?? '')
+  const { data: runOpcodes } = useRunOpcodes(runId, fetchOnDisk)
   const { data: index } = useIndex()
   const { data: containerLogHead, isLoading: containerLogLoading } = useQuery({
     queryKey: ['run', runId, 'container-log-head'],
@@ -176,6 +190,7 @@ export function RunDetailPage() {
 
   const [compareMode, setCompareMode] = useState(false)
   const [selectedRunIds, setSelectedRunIds] = useState<Set<string>>(new Set())
+  const [showOpcodeDiff, setShowOpcodeDiff] = useState(false)
 
   const handleSelectionChange = useCallback((id: string, selected: boolean) => {
     setSelectedRunIds((prev) => {
@@ -198,15 +213,84 @@ export function RunDetailPage() {
   // Compute clientRuns and recentRuns before early returns to satisfy hooks rules.
   const clientRuns = useMemo(() => {
     if (!index || !config) return []
-    return index.entries.filter(
-      (r) => r.suite_hash === config.suite_hash && r.instance.client === config.instance.client,
-    )
+    const myLabels = config.metadata?.labels ?? {}
+    const myLabelKeys = Object.keys(myLabels)
+    return index.entries.filter((r) => {
+      if (r.suite_hash !== config.suite_hash) return false
+      if (r.instance.client !== config.instance.client) return false
+      // Same labels: same set of keys, same values for each key.
+      const otherLabels = r.metadata ?? {}
+      const otherKeys = Object.keys(otherLabels)
+      if (otherKeys.length !== myLabelKeys.length) return false
+      for (const k of myLabelKeys) {
+        if (otherLabels[k] !== myLabels[k]) return false
+      }
+      return true
+    })
   }, [index, config])
 
   const recentRuns = useMemo(() => {
     const sorted = [...clientRuns].sort((a, b) => b.timestamp - a.timestamp)
     return sorted.slice(0, MAX_COMPARE_RUNS)
   }, [clientRuns])
+
+  // Merge per-run opcode counts (test-opcodes.json) into the suite's
+  // SuiteTest list so OpcodeHeatmap renders run-extracted data when
+  // available. Per-test, sum counts across the array of newPayloads
+  // (one entry per engine_newPayload* in the test step). If only the
+  // suite has counts, the suite values are kept as-is.
+  const { mergedSuiteTests, opcodeDiffs, opcodeDiffByTest } = useMemo(() => {
+    if (!suite?.tests) {
+      return {
+        mergedSuiteTests: undefined,
+        opcodeDiffs: [] as OpcodeTestDiff[],
+        opcodeDiffByTest: {} as Record<string, OpcodeDiffRow[]>,
+      }
+    }
+
+    const sumPayloads = (entries: Array<Record<string, number>>): Record<string, number> => {
+      const out: Record<string, number> = {}
+      for (const entry of entries) {
+        for (const [op, count] of Object.entries(entry)) {
+          out[op] = (out[op] ?? 0) + count
+        }
+      }
+      return out
+    }
+
+    const diffOpcodes = (suiteCounts: Record<string, number>, runCounts: Record<string, number>): OpcodeDiffRow[] => {
+      const all = new Set<string>([...Object.keys(suiteCounts), ...Object.keys(runCounts)])
+      const rows: OpcodeDiffRow[] = []
+      for (const op of all) {
+        const s = suiteCounts[op] ?? 0
+        const r = runCounts[op] ?? 0
+        if (s !== r) rows.push({ opcode: op, suite: s, run: r, delta: r - s })
+      }
+      // Sort by largest absolute delta first.
+      rows.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta))
+      return rows
+    }
+
+    const diffs: OpcodeTestDiff[] = []
+    const byTest: Record<string, OpcodeDiffRow[]> = {}
+    const merged = suite.tests.map((t) => {
+      const runEntries = runOpcodes?.[t.name]
+      if (!runEntries || runEntries.length === 0) return t
+
+      const runCounts = sumPayloads(runEntries)
+      const suiteCounts = t.opcode_count ?? t.eest?.info?.opcode_count
+      if (suiteCounts && Object.keys(suiteCounts).length > 0) {
+        const rows = diffOpcodes(suiteCounts, runCounts)
+        if (rows.length > 0) {
+          diffs.push({ name: t.name, rows })
+          byTest[t.name] = rows
+        }
+      }
+      return { ...t, opcode_count: runCounts }
+    })
+
+    return { mergedSuiteTests: merged, opcodeDiffs: diffs, opcodeDiffByTest: byTest }
+  }, [suite, runOpcodes])
 
   const updateSearch = (updates: Partial<typeof search>) => {
     navigate({
@@ -663,22 +747,70 @@ export function RunDetailPage() {
 
       {result && (
         <>
-          <div className="overflow-hidden rounded-sm bg-white p-4 shadow-xs dark:bg-gray-800">
-            <div className="mb-4 flex items-center justify-between">
-              <h3 className="flex items-center gap-2 text-sm/6 font-medium text-gray-900 dark:text-gray-100">
-                <Flame className="size-4 text-gray-400 dark:text-gray-500" />
+          <div className="sticky top-0 z-30 -mx-4 flex flex-wrap items-center gap-3 border-b border-gray-200 bg-white/95 px-4 py-2 backdrop-blur-sm dark:border-gray-700 dark:bg-gray-900/95">
+            <FilterInput
+              placeholder="Search… or e.g. opcode:ORIGIN gas:90M"
+              title={TEST_FILTER_HINT}
+              value={q}
+              onValueChange={handleSearchChange}
+              className="min-w-0 flex-1 rounded-xs border border-gray-300 bg-white px-3 py-1.5 text-sm/6 placeholder-gray-400 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-500"
+            />
+            <div className="flex shrink-0 items-center gap-2 text-xs/5 text-gray-500 dark:text-gray-400">
+              <span>Slow threshold:</span>
+              <input
+                type="range"
+                min={MIN_THRESHOLD}
+                max={MAX_THRESHOLD}
+                value={heatmapThreshold ?? DEFAULT_THRESHOLD}
+                onChange={(e) => handleHeatmapThresholdChange(Number(e.target.value))}
+                className="h-1.5 w-24 cursor-pointer appearance-none rounded-full bg-gray-200 accent-blue-500 dark:bg-gray-700"
+              />
+              <input
+                type="number"
+                min={MIN_THRESHOLD}
+                max={MAX_THRESHOLD}
+                value={heatmapThreshold ?? DEFAULT_THRESHOLD}
+                onChange={(e) => handleHeatmapThresholdChange(Number(e.target.value))}
+                className="w-16 rounded-sm border border-gray-300 bg-white px-1.5 py-0.5 text-center text-xs/5 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+              />
+              <span>MGas/s</span>
+              {(heatmapThreshold ?? DEFAULT_THRESHOLD) !== DEFAULT_THRESHOLD && (
+                <button
+                  onClick={() => handleHeatmapThresholdChange(DEFAULT_THRESHOLD)}
+                  className="text-xs/5 text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                >
+                  Reset
+                </button>
+              )}
+            </div>
+          </div>
+          <FacetPanel
+            testNames={Object.keys(result.tests)}
+            query={q}
+            onToggle={(term) => handleSearchChange(toggleSearchTerm(q, term))}
+          />
+          <DimensionInsights
+            tests={result.tests}
+            stepFilter={stepFilter}
+            searchQuery={q}
+            statusFilter={status}
+            query={q}
+            onToggle={(term) => handleSearchChange(toggleSearchTerm(q, term))}
+            onTestClick={handleTestModalChange}
+            threshold={heatmapThreshold}
+          />
+          <div className="overflow-hidden rounded-sm bg-white shadow-xs dark:bg-gray-800">
+            <div className="flex items-center gap-2 border-b border-gray-200 px-4 py-3 dark:border-gray-700">
+              <Flame className="size-4 text-gray-400 dark:text-gray-500" />
+              <h3 className="text-sm/6 font-medium text-gray-900 dark:text-gray-100">
                 Performance Heatmap
               </h3>
-              <FilterInput
-                placeholder="Filter tests..."
-                value={q}
-                onValueChange={handleSearchChange}
-                className="rounded-xs border border-gray-300 bg-white px-3 py-1 text-sm/6 placeholder-gray-400 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-500"
-              />
             </div>
+            <div className="p-4">
             <TestHeatmap
               tests={result.tests}
-              suiteTests={suite?.tests}
+              suiteTests={mergedSuiteTests ?? suite?.tests}
+              opcodeDiffByTest={opcodeDiffByTest}
               runId={runId}
               suiteHash={config.suite_hash}
               selectedTest={testModal}
@@ -692,23 +824,53 @@ export function RunDetailPage() {
               onSortModeChange={handleHeatmapSortChange}
               groupMode={heatmapGroup}
               onGroupModeChange={handleHeatmapGroupChange}
-              onThresholdChange={handleHeatmapThresholdChange}
               onSearchChange={handleSearchChange}
               activeStepTab={activeStepTab}
               onActiveStepTabChange={handleStepTabChange}
               expandedExecRows={expandedExecRows}
               onExpandedExecRowsChange={handleExpandedExecRowsChange}
             />
+            </div>
           </div>
 
-          {suite?.tests && suite.tests.length > 0 && (
+          {mergedSuiteTests && mergedSuiteTests.length > 0 && (
             <div className="overflow-hidden rounded-sm bg-white p-4 shadow-xs dark:bg-gray-800">
+              {runOpcodes && Object.keys(runOpcodes).length > 0 && (
+                <div className="mb-3 rounded-sm border border-blue-200 bg-blue-50 px-3 py-2 text-xs/5 text-blue-800 dark:border-blue-900/50 dark:bg-blue-950/40 dark:text-blue-200">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span>
+                      Showing opcode counts extracted from this run (
+                      <code className="font-mono">test-opcodes.json</code>); suite-defined counts are
+                      overridden where available.
+                    </span>
+                    {opcodeDiffs.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setShowOpcodeDiff((v) => !v)}
+                        className="inline-flex items-center rounded-xs bg-yellow-100 px-1.5 py-0.5 font-medium text-yellow-800 hover:bg-yellow-200 dark:bg-yellow-900/50 dark:text-yellow-200 dark:hover:bg-yellow-900/70"
+                      >
+                        ⚠ {opcodeDiffs.length} test{opcodeDiffs.length === 1 ? '' : 's'} differ from suite
+                        <span className="ml-1.5 text-yellow-700 dark:text-yellow-300">{showOpcodeDiff ? '▾' : '▸'}</span>
+                      </button>
+                    )}
+                  </div>
+                  {showOpcodeDiff && opcodeDiffs.length > 0 && (
+                    <div className="mt-3 max-h-96 overflow-y-auto rounded-xs border border-blue-200 bg-white p-2 text-gray-900 dark:border-blue-900/50 dark:bg-gray-900 dark:text-gray-100">
+                      <div className="flex flex-col gap-3">
+                        {opcodeDiffs.map((d) => (
+                          <OpcodeDiffPanel key={d.name} caption={d.name} rows={d.rows} />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
               <OpcodeHeatmap
-                tests={suite.tests}
+                tests={mergedSuiteTests}
                 extraColumns={[{
                   name: 'Mgas/s',
                   getValue: (testIndex: number) => {
-                    const testName = suite.tests[testIndex]?.name
+                    const testName = mergedSuiteTests[testIndex]?.name
                     if (!testName) return undefined
                     const entry = result.tests[testName]
                     if (!entry) return undefined
@@ -719,9 +881,9 @@ export function RunDetailPage() {
                   width: 54,
                   format: (v: number) => v.toFixed(1),
                 }]}
-                onTestClick={(testIndex) => handleTestModalChange(suite.tests[testIndex - 1]?.name)}
+                onTestClick={(testIndex) => handleTestModalChange(mergedSuiteTests[testIndex - 1]?.name)}
                 searchQuery={q}
-                onSearchChange={handleSearchChange}
+                hideSearchInput
                 fullscreen={ohFs}
                 onFullscreenChange={handleOpcodeHeatmapFullscreenChange}
               />
@@ -729,11 +891,14 @@ export function RunDetailPage() {
           )}
 
           {blockLogs && Object.keys(blockLogs).length > 0 && (
-            <BlockLogsDashboard blockLogs={blockLogs} runId={runId} suiteTests={suite?.tests} onTestClick={handleTestModalChange} searchQuery={q} onSearchChange={handleSearchChange} fullscreen={blFs} onFullscreenChange={handleBlockLogsFullscreenChange} />
+            <BlockLogsDashboard blockLogs={blockLogs} runId={runId} suiteTests={suite?.tests} onTestClick={handleTestModalChange} searchQuery={q} fullscreen={blFs} onFullscreenChange={handleBlockLogsFullscreenChange} />
           )}
 
           <ResourceUsageCharts
             tests={result.tests}
+            suiteTests={mergedSuiteTests ?? suite?.tests}
+            searchQuery={q}
+            statusFilter={status}
             onTestClick={handleTestModalChange}
             resourceCollectionMethod={config.system_resource_collection_method}
             cpuCores={config.instance.resource_limits?.cpuset_cpus

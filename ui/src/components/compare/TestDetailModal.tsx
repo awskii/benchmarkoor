@@ -1,9 +1,10 @@
 import { useMemo, useState } from 'react'
 import { useNavigate } from '@tanstack/react-router'
-import { Check, Copy, GitCompareArrows, X } from 'lucide-react'
+import { GitCompareArrows, X } from 'lucide-react'
 import clsx from 'clsx'
 import type { RunResult } from '@/api/types'
 import { type StepTypeOption, getAggregatedStats } from '@/pages/RunDetailPage'
+import { TestName } from '@/components/shared/TestName'
 import { formatTimestamp } from '@/utils/date'
 import { type GroupDef } from './groupUtils'
 import { MAX_COMPARE_RUNS, MIN_COMPARE_RUNS } from './constants'
@@ -20,6 +21,10 @@ interface TestDetailModalProps {
   groupRunIds: string[][]
   stepFilter: StepTypeOption[]
   sampleSize: number
+  /** Current page-level search query (used to highlight active chips). */
+  searchQuery?: string
+  /** Toggle a `key:value` term in the page-level search. */
+  onChipFilterToggle?: (term: string) => void
   onClose: () => void
 }
 
@@ -37,6 +42,8 @@ export function TestDetailModal({
   groupRunIds,
   stepFilter,
   sampleSize,
+  searchQuery,
+  onChipFilterToggle,
   onClose,
 }: TestDetailModalProps) {
   const SLOT_COLORS = ['text-blue-700 dark:text-blue-300', 'text-orange-700 dark:text-orange-300', 'text-purple-700 dark:text-purple-300', 'text-green-700 dark:text-green-300', 'text-red-700 dark:text-red-300']
@@ -146,11 +153,8 @@ export function TestDetailModal({
             <h3 className="text-sm/6 font-medium text-gray-900 dark:text-gray-100">
               {testOrder !== undefined ? `Test #${testOrder}` : 'Test Detail'}
             </h3>
-            <div className="mt-0.5 flex items-start gap-1.5">
-              <p className="break-all font-mono text-xs text-gray-500 dark:text-gray-400">
-                {testName}
-              </p>
-              <CopyButton text={testName} />
+            <div className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">
+              <TestName name={testName} showRawBelow showCopy onChipClick={onChipFilterToggle} activeQuery={searchQuery} />
             </div>
           </div>
           <button onClick={onClose} className="shrink-0 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300">
@@ -376,22 +380,3 @@ function StatCell({ label, value, title }: { label: string; value?: string; titl
   )
 }
 
-function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false)
-
-  return (
-    <button
-      type="button"
-      onClick={(e) => {
-        e.stopPropagation()
-        navigator.clipboard.writeText(text)
-        setCopied(true)
-        setTimeout(() => setCopied(false), 1500)
-      }}
-      className="shrink-0 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300"
-      title="Copy test name"
-    >
-      {copied ? <Check className="size-3.5 text-green-500" /> : <Copy className="size-3.5" />}
-    </button>
-  )
-}
