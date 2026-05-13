@@ -2,8 +2,8 @@ import { useCallback, useMemo, useState, useEffect, useRef } from 'react'
 import { Link, useParams, useNavigate, useSearch } from '@tanstack/react-router'
 import { Tab, TabGroup, TabList, TabPanel, TabPanels } from '@headlessui/react'
 import clsx from 'clsx'
-import { ChevronRight, SquareStack, GitCompareArrows, Layers, LayoutGrid, Clock, Grid3X3, Trash2, Plus, X } from 'lucide-react'
-import { type IndexEntry, type IndexStepType, ALL_INDEX_STEP_TYPES, DEFAULT_INDEX_STEP_FILTER, type SuiteTest } from '@/api/types'
+import { ChevronRight, SquareStack, GitCompareArrows, Layers, LayoutGrid, Clock, Trash2, Plus, X } from 'lucide-react'
+import { type IndexEntry, type IndexStepType, ALL_INDEX_STEP_TYPES, DEFAULT_INDEX_STEP_FILTER } from '@/api/types'
 import { useSuite } from '@/api/hooks/useSuite'
 import { useSuiteStats } from '@/api/hooks/useSuiteStats'
 import { useIndex, useLiveRuns } from '@/api/hooks/useIndex'
@@ -15,9 +15,12 @@ import { RunsHeatmap, type ColorNormalization } from '@/components/suite-detail/
 import { TestHeatmap } from '@/components/suite-detail/TestHeatmap'
 import { SuiteSource } from '@/components/suite-detail/SuiteSource'
 import { TestFilesList, type OpcodeSortMode } from '@/components/suite-detail/TestFilesList'
+import { isPayloadSortCol, type PayloadSort } from '@/components/suite-detail/payloadSort'
 import { FacetPanel } from '@/components/shared/FacetPanel'
-import { toggleSearchTerm } from '@/utils/eestNameFilter'
+import { FilterInput } from '@/components/shared/FilterInput'
+import { toggleSearchTerm, TEST_FILTER_HINT } from '@/utils/eestNameFilter'
 import { OpcodeHeatmap } from '@/components/suite-detail/OpcodeHeatmap'
+import { PayloadSizesSection } from '@/components/suite-detail/PayloadSizesSection'
 import { RunsTable } from '@/components/runs/RunsTable'
 import { sortIndexEntries, type SortColumn, type SortDirection } from '@/components/runs/sortEntries'
 import { RunFilters, type TestStatusFilter } from '@/components/runs/RunFilters'
@@ -50,37 +53,6 @@ function serializeStepFilter(steps: IndexStepType[]): string | undefined {
     return undefined
   }
   return steps.join(',')
-}
-
-function OpcodeHeatmapSection({
-  tests,
-  onTestClick,
-  searchQuery,
-  onSearchChange,
-}: {
-  tests: SuiteTest[]
-  onTestClick?: (testIndex: number) => void
-  searchQuery?: string
-  onSearchChange?: (q: string) => void
-}) {
-  const [expanded, setExpanded] = useState(true)
-  return (
-    <>
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex w-full items-center gap-2 px-4 py-3 text-left text-sm/6 font-medium text-gray-900 hover:bg-gray-50 dark:text-gray-100 dark:hover:bg-gray-700/50"
-      >
-        <ChevronRight className={clsx('size-4 text-gray-500 transition-transform', expanded && 'rotate-90')} />
-        <Grid3X3 className="size-4 text-gray-400 dark:text-gray-500" />
-        Opcode Heatmap
-      </button>
-      {expanded && (
-        <div className="border-t border-gray-200 p-4 dark:border-gray-700">
-          <OpcodeHeatmap tests={tests} onTestClick={onTestClick} searchQuery={searchQuery} onSearchChange={onSearchChange} />
-        </div>
-      )}
-    </>
-  )
 }
 
 // ---------------------------------------------------------------------------
@@ -291,8 +263,23 @@ export function SuiteDetailPage() {
     hRpc?: string
     hPs?: string
     groupBy?: string
+    testView?: 'general' | 'payload-sizes' | 'payload-sizes-json'
+    psort?: string
+    psortDir?: 'asc' | 'desc'
+    psOrder?: 'index' | 'size'
+    psEncoding?: 'ssz' | 'json'
   }
-  const { tab, client, image, status = 'all', sortBy = 'timestamp', sortDir = 'desc', filesPage, detail, opcodeSort, q, chartMode = 'runCount', heatmapColor = 'suite', hq, hn, hr, hFs, hStat, hCs, hTh, hRpc, hPs, groupBy } = search
+  const { tab, client, image, status = 'all', sortBy = 'timestamp', sortDir = 'desc', filesPage, detail, opcodeSort, q, chartMode = 'runCount', heatmapColor = 'suite', hq, hn, hr, hFs, hStat, hCs, hTh, hRpc, hPs, groupBy, testView } = search
+  // Parse the payload-sizes sort from the URL. Defaults to no sort (null).
+  const payloadSort: PayloadSort | null = search.psort && isPayloadSortCol(search.psort)
+    ? { col: search.psort, dir: search.psortDir === 'asc' ? 'asc' : 'desc' }
+    : null
+  // Payload-sizes chart bar order. 'index' is the default; only the
+  // non-default value lives in the URL to keep things clean.
+  const psOrder: 'index' | 'size' = search.psOrder === 'size' ? 'size' : 'index'
+  // Payload-sizes chart encoding (SSZ vs JSON view). 'ssz' is the
+  // default; non-default lives in the URL.
+  const psEncoding: 'ssz' | 'json' = search.psEncoding === 'json' ? 'json' : 'ssz'
   const chartPassingOnly = search.chartPassingOnly !== 'false'
   const stepFilter = parseStepFilter(search.steps)
   const labelFilters = parseLabelFilters(search.labels)
@@ -684,7 +671,7 @@ export function SuiteDetailPage() {
     navigate({
       to: '/suites/$suiteHash',
       params: { suiteHash },
-      search: { tab, client, image, status, sortBy, sortDir, filesPage: page, q, steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters), groupBy },
+      search: { tab, client, image, status, sortBy, sortDir, filesPage: page, q, steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters), groupBy, testView, psort: search.psort, psortDir: search.psortDir, psOrder: search.psOrder, psEncoding: search.psEncoding },
     })
   }
 
@@ -703,7 +690,7 @@ export function SuiteDetailPage() {
     navigate({
       to: '/suites/$suiteHash',
       params: { suiteHash },
-      search: { tab, client, image, status, sortBy, sortDir, filesPage, detail: index, opcodeSort, q, steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters), groupBy },
+      search: { tab, client, image, status, sortBy, sortDir, filesPage, detail: index, opcodeSort, q, steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters), groupBy, testView, psort: search.psort, psortDir: search.psortDir, psOrder: search.psOrder, psEncoding: search.psEncoding },
     })
   }
 
@@ -711,7 +698,62 @@ export function SuiteDetailPage() {
     navigate({
       to: '/suites/$suiteHash',
       params: { suiteHash },
-      search: { tab, client, image, status, sortBy, sortDir, filesPage, detail, opcodeSort: sort === 'name' ? undefined : sort, q, steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters), groupBy },
+      search: { tab, client, image, status, sortBy, sortDir, filesPage, detail, opcodeSort: sort === 'name' ? undefined : sort, q, steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters), groupBy, testView, psort: search.psort, psortDir: search.psortDir, psOrder: search.psOrder, psEncoding: search.psEncoding },
+    })
+  }
+
+  const handleTestViewChange = (mode: 'general' | 'payload-sizes' | 'payload-sizes-json') => {
+    navigate({
+      to: '/suites/$suiteHash',
+      params: { suiteHash },
+      // 'general' is the default; drop it from the URL to keep it clean.
+      search: { tab, client, image, status, sortBy, sortDir, filesPage, detail, opcodeSort, q, steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters), groupBy, testView: mode === 'general' ? undefined : mode, psort: search.psort, psortDir: search.psortDir, psOrder: search.psOrder, psEncoding: search.psEncoding },
+    })
+  }
+
+  const handlePsOrderChange = (next: 'index' | 'size') => {
+    navigate({
+      to: '/suites/$suiteHash',
+      params: { suiteHash },
+      // 'index' is the default; drop it from the URL.
+      search: {
+        tab, client, image, status, sortBy, sortDir, filesPage, detail, opcodeSort, q,
+        steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters),
+        groupBy, testView, psort: search.psort, psortDir: search.psortDir,
+        psOrder: next === 'index' ? undefined : next,
+        psEncoding: search.psEncoding,
+      },
+    })
+  }
+
+  const handlePsEncodingChange = (next: 'ssz' | 'json') => {
+    navigate({
+      to: '/suites/$suiteHash',
+      params: { suiteHash },
+      // 'ssz' is the default; drop it from the URL.
+      search: {
+        tab, client, image, status, sortBy, sortDir, filesPage, detail, opcodeSort, q,
+        steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters),
+        groupBy, testView, psort: search.psort, psortDir: search.psortDir,
+        psOrder: search.psOrder,
+        psEncoding: next === 'ssz' ? undefined : next,
+      },
+    })
+  }
+
+  const handlePayloadSortChange = (next: PayloadSort | null) => {
+    navigate({
+      to: '/suites/$suiteHash',
+      params: { suiteHash },
+      // desc is the implicit default; drop psortDir when desc to keep the URL tidy.
+      search: {
+        tab, client, image, status, sortBy, sortDir, filesPage, detail, opcodeSort, q,
+        steps: serializeStepFilter(stepFilter), labels: serializeLabelFilters(labelFilters),
+        groupBy, testView,
+        psort: next ? next.col : undefined,
+        psortDir: next && next.dir === 'asc' ? 'asc' : undefined,
+        psOrder: search.psOrder, psEncoding: search.psEncoding,
+      },
     })
   }
 
@@ -1397,6 +1439,21 @@ export function SuiteDetailPage() {
             )}
           </TabPanel>
           <TabPanel className="flex flex-col gap-4">
+            {/* Global search for the Tests tab. Sticky to the viewport on
+                scroll so the user can refine the filter without scrolling
+                back to the top. Drives every downstream section
+                (FacetPanel, TestHeatmap, OpcodeHeatmap, PayloadSizes, the
+                tests table) via the shared ?q= search param. Mirrors the
+                pattern used on the run-detail page. */}
+            <div className="sticky top-0 z-30 -mx-4 flex flex-wrap items-center gap-3 border-b border-gray-200 bg-white/95 px-4 py-2 backdrop-blur-sm dark:border-gray-700 dark:bg-gray-900/95">
+              <FilterInput
+                placeholder="Search… or e.g. opcode:ORIGIN gas:90M"
+                title={TEST_FILTER_HINT}
+                value={q ?? ''}
+                onValueChange={(v) => handleSearchChange(v || undefined)}
+                className="min-w-0 flex-1 rounded-xs border border-gray-300 bg-white px-3 py-1.5 text-sm/6 placeholder-gray-400 focus:border-blue-500 focus:outline-hidden focus:ring-1 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-700 dark:text-gray-100 dark:placeholder-gray-500"
+              />
+            </div>
             <FacetPanel
               testNames={(suite.tests ?? []).map((t) => t.name)}
               query={q ?? ''}
@@ -1415,12 +1472,26 @@ export function SuiteDetailPage() {
               )
             )}
             {suite.tests?.some((t) => { const oc = t.opcode_count ?? t.eest?.info?.opcode_count; return oc && Object.keys(oc).length > 0 }) && (
-              <div className="overflow-hidden rounded-sm border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
-                <OpcodeHeatmapSection
+              <div className="overflow-hidden rounded-sm border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+                <OpcodeHeatmap
                   tests={suite.tests ?? []}
                   onTestClick={handleDetailChange}
                   searchQuery={q}
                   onSearchChange={(value) => handleSearchChange(value || undefined)}
+                  hideSearchInput
+                />
+              </div>
+            )}
+            {suite.tests?.some((t) => !!t.payload_sizes) && (
+              <div className="overflow-hidden rounded-sm border border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800">
+                <PayloadSizesSection
+                  tests={suite.tests ?? []}
+                  onTestClick={handleDetailChange}
+                  searchQuery={q ?? ''}
+                  order={psOrder}
+                  onOrderChange={handlePsOrderChange}
+                  encoding={psEncoding}
+                  onEncodingChange={handlePsEncodingChange}
                 />
               </div>
             )}
@@ -1436,6 +1507,11 @@ export function SuiteDetailPage() {
               onDetailChange={handleDetailChange}
               opcodeSort={opcodeSort}
               onOpcodeSortChange={handleOpcodeSortChange}
+              testView={testView}
+              onTestViewChange={handleTestViewChange}
+              payloadSort={payloadSort}
+              onPayloadSortChange={handlePayloadSortChange}
+              hideSearchInput
             />
           </TabPanel>
           {hasPreRunSteps && (
