@@ -104,10 +104,12 @@ func (r *runner) runTestsWithContainerStrategy(
 			)
 		}
 
-		// Brief settle time so the client finishes any in-flight
-		// initialisation before we send SIGTERM.
-		log.Info("Waiting 2s for client to settle before stop")
-		time.Sleep(2 * time.Second)
+		// Settle time so the client finishes any in-flight
+		// initialisation and flushes its DB before we send SIGTERM.
+		// Too short here (e.g. reth/MDBX) snapshots a dirty datadir,
+		// which makes the client come up in "syncing" on restart.
+		log.Info("Waiting 20s for client to settle before stop")
+		time.Sleep(20 * time.Second)
 
 		// Stop the initial container so writes are flushed to disk.
 		// Use the default 60s SIGTERM grace period so the client has
