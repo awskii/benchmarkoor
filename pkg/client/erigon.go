@@ -109,3 +109,8 @@ func (s *erigonSpec) RPCRollbackSpec() *RPCRollbackSpec {
 func (s *erigonSpec) DefaultConfigFiles() map[string]string {
 	return nil
 }
+
+// SnapshotPrepareArgs returns nil; Erigon needs no snapshot-only args.
+func (s *erigonSpec) SnapshotPrepareArgs() []string {
+	return nil
+}

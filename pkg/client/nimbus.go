@@ -88,3 +88,8 @@ func (s *nimbusSpec) RPCRollbackSpec() *RPCRollbackSpec {
 func (s *nimbusSpec) DefaultConfigFiles() map[string]string {
 	return nil
 }
+
+// SnapshotPrepareArgs returns nil; Nimbus needs no snapshot-only args.
+func (s *nimbusSpec) SnapshotPrepareArgs() []string {
+	return nil
+}
