@@ -699,8 +699,25 @@ func (r *runner) runContainerLifecycle(
 	params.DataDirCfg = datadirCfg
 	params.UseDataDir = useDataDir
 
+	// Apply client-specific snapshot-prepare args to the initial (pre-run/snapshot) container only, scoped to ZFS container-recreate; per-test containers clone params.ContainerSpec and keep the base command.
+	createSpec := containerSpec
+
+	if prepareArgs := spec.SnapshotPrepareArgs(); len(prepareArgs) > 0 &&
+		r.cfg.FullConfig != nil &&
+		r.cfg.FullConfig.GetRollbackStrategy(instance) ==
+			config.RollbackStrategyContainerRecreate &&
+		datadirCfg != nil && datadirCfg.Method == "zfs" {
+		prepareSpec := *containerSpec
+		prepareSpec.Command = append(append([]string{}, cmd...), prepareArgs...)
+		createSpec = &prepareSpec
+
+		log.WithField("args", prepareArgs).Info(
+			"Applying snapshot-prepare args to initial (pre-run) container",
+		)
+	}
+
 	// Create container.
-	containerID, err := r.containerMgr.CreateContainer(ctx, containerSpec)
+	containerID, err := r.containerMgr.CreateContainer(ctx, createSpec)
 	if err != nil {
 		return fmt.Errorf("creating container: %w", err)
 	}

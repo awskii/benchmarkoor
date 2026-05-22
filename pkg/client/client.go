@@ -88,6 +88,9 @@ type Spec interface {
 	// Keys are target paths inside the container, values are file contents.
 	// Returns nil if no config files are needed.
 	DefaultConfigFiles() map[string]string
+
+	// SnapshotPrepareArgs returns args for the ZFS snapshot-prep container only (not per-test measurement); nil if none.
+	SnapshotPrepareArgs() []string
 }
 
 // Registry manages client specifications.

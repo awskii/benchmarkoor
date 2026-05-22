@@ -103,3 +103,8 @@ func (s *besuSpec) RPCRollbackSpec() *RPCRollbackSpec {
 func (s *besuSpec) DefaultConfigFiles() map[string]string {
 	return nil
 }
+
+// SnapshotPrepareArgs returns nil; Besu needs no snapshot-only args.
+func (s *besuSpec) SnapshotPrepareArgs() []string {
+	return nil
+}

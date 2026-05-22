@@ -89,3 +89,8 @@ func (s *ethrexSpec) RPCRollbackSpec() *RPCRollbackSpec {
 func (s *ethrexSpec) DefaultConfigFiles() map[string]string {
 	return nil
 }
+
+// SnapshotPrepareArgs returns nil; Ethrex needs no snapshot-only args.
+func (s *ethrexSpec) SnapshotPrepareArgs() []string {
+	return nil
+}

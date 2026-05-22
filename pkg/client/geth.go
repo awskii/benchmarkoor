@@ -108,3 +108,8 @@ IdleTimeout = 120000000000 # 120s
 `,
 	}
 }
+
+// SnapshotPrepareArgs returns nil; Geth needs no snapshot-only args.
+func (s *gethSpec) SnapshotPrepareArgs() []string {
+	return nil
+}

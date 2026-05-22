@@ -101,3 +101,8 @@ func (s *nethermindSpec) RPCRollbackSpec() *RPCRollbackSpec {
 func (s *nethermindSpec) DefaultConfigFiles() map[string]string {
 	return nil
 }
+
+// SnapshotPrepareArgs returns nil; Nethermind needs no snapshot-only args.
+func (s *nethermindSpec) SnapshotPrepareArgs() []string {
+	return nil
+}

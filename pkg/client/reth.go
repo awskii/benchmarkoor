@@ -90,3 +90,11 @@ func (s *rethSpec) RPCRollbackSpec() *RPCRollbackSpec {
 func (s *rethSpec) DefaultConfigFiles() map[string]string {
 	return nil
 }
+
+// SnapshotPrepareArgs makes reth persist every block during snapshot prep so the pre-run head reaches disk (else the snapshot lags a block and tests hang SYNCING).
+func (s *rethSpec) SnapshotPrepareArgs() []string {
+	return []string{
+		"--engine.persistence-threshold=0",
+		"--engine.memory-block-buffer-target=0",
+	}
+}
