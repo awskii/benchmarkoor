@@ -56,6 +56,48 @@ func TestBuildsFillImage(t *testing.T) {
 	}
 }
 
+func TestGetBuilderRunTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want time.Duration
+	}{
+		{"nil builder", &Config{}, 0},
+		{"empty", &Config{Builder: &BuilderConfig{}}, 0},
+		{"valid", &Config{Builder: &BuilderConfig{RunTimeout: "2h"}}, 2 * time.Hour},
+		{"invalid falls back to 0", &Config{Builder: &BuilderConfig{RunTimeout: "nope"}}, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.cfg.GetBuilderRunTimeout())
+		})
+	}
+}
+
+func TestValidateBuilder_RunTimeout(t *testing.T) {
+	require.NoError(t, (&Config{Builder: &BuilderConfig{RunTimeout: "30m"}}).validateBuilder())
+
+	err := (&Config{Builder: &BuilderConfig{RunTimeout: "5 hours"}}).validateBuilder()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "builder.run_timeout")
+}
+
+func TestLoad_BuilderRunTimeoutEnv(t *testing.T) {
+	// The key is absent from the file — the env binding must still populate it.
+	f := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(f, []byte(
+		"builder:\n  state_actor:\n    images: {geth: img}\n    targets:\n      - client: geth\n        output_dir: /tmp/x\n"), 0o600))
+
+	t.Setenv("BENCHMARKOOR_BUILDER_RUN_TIMEOUT", "3h")
+
+	c, err := Load(f)
+	require.NoError(t, err)
+	require.NotNil(t, c.Builder)
+	assert.Equal(t, "3h", c.Builder.RunTimeout)
+	assert.Equal(t, 3*time.Hour, c.GetBuilderRunTimeout())
+}
+
 func TestLoad_InlineAddressStubsKeyCasing(t *testing.T) {
 	// Viper is case-insensitive and lowercases all map keys; EEST resolves stub
 	// names by exact match, so Load must restore the original casing.
