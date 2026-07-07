@@ -408,6 +408,7 @@ type EESTPayloadDefaults struct {
 	AddressStubs       map[string]map[string]string `yaml:"address_stubs,omitempty" mapstructure:"address_stubs"`
 	GasBenchmarkValues []int                        `yaml:"gas_benchmark_values,omitempty" mapstructure:"gas_benchmark_values"`
 	FixedOpcodeCount   *[]float64                   `yaml:"fixed_opcode_count,omitempty" mapstructure:"fixed_opcode_count"`
+	ExtractOpcodeCount *bool                        `yaml:"extract_opcode_count,omitempty" mapstructure:"extract_opcode_count"`
 	DataDirMethod      string                       `yaml:"datadir_method,omitempty" mapstructure:"datadir_method"`
 	MaxGasPerTest      *uint64                      `yaml:"max_gas_per_test,omitempty" mapstructure:"max_gas_per_test"`
 	RPCSeedKey         string                       `yaml:"rpc_seed_key,omitempty" mapstructure:"rpc_seed_key"`
@@ -460,10 +461,18 @@ type EESTPayloadTarget struct {
 	AddressStubs       map[string]map[string]string `yaml:"address_stubs,omitempty" mapstructure:"address_stubs"`
 	GasBenchmarkValues []int                        `yaml:"gas_benchmark_values,omitempty" mapstructure:"gas_benchmark_values"`
 	FixedOpcodeCount   *[]float64                   `yaml:"fixed_opcode_count,omitempty" mapstructure:"fixed_opcode_count"`
-	DataDirMethod      string                       `yaml:"datadir_method,omitempty" mapstructure:"datadir_method"`
-	MaxGasPerTest      *uint64                      `yaml:"max_gas_per_test,omitempty" mapstructure:"max_gas_per_test"`
-	RPCSeedKey         string                       `yaml:"rpc_seed_key,omitempty" mapstructure:"rpc_seed_key"`
-	FillerExtraArgs    []string                     `yaml:"filler_extra_args,omitempty" mapstructure:"filler_extra_args"`
+	// ExtractOpcodeCount enables fill-stateful's --extract-opcode-count: after
+	// building each execution-phase block it is traced via debug_traceBlockByHash
+	// with a custom JS opcode-counting tracer, recording per-opcode execution
+	// counts in the fixture's _info.metadata.opcode_count. The per-block re-trace
+	// with the custom tracer is what makes it slow, so it's opt-in. Works with any
+	// filler exposing debug_traceBlockByHash + JS tracer support (geth is the
+	// validated one).
+	ExtractOpcodeCount *bool    `yaml:"extract_opcode_count,omitempty" mapstructure:"extract_opcode_count"`
+	DataDirMethod      string   `yaml:"datadir_method,omitempty" mapstructure:"datadir_method"`
+	MaxGasPerTest      *uint64  `yaml:"max_gas_per_test,omitempty" mapstructure:"max_gas_per_test"`
+	RPCSeedKey         string   `yaml:"rpc_seed_key,omitempty" mapstructure:"rpc_seed_key"`
+	FillerExtraArgs    []string `yaml:"filler_extra_args,omitempty" mapstructure:"filler_extra_args"`
 }
 
 // ResolveTarget returns a copy of the i-th target with any unset hoistable
@@ -512,6 +521,10 @@ func (e *EESTPayloadsConfig) ResolveTarget(i int) EESTPayloadTarget {
 
 	if t.FixedOpcodeCount == nil {
 		t.FixedOpcodeCount = g.FixedOpcodeCount
+	}
+
+	if t.ExtractOpcodeCount == nil {
+		t.ExtractOpcodeCount = g.ExtractOpcodeCount
 	}
 
 	if t.DataDirMethod == "" {

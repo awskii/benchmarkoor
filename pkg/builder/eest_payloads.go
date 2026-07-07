@@ -1227,6 +1227,14 @@ func buildFillArgs(
 		}
 	}
 
+	// --extract-opcode-count traces each execution-phase block via
+	// debug_traceBlockByHash with a custom JS tracer and records per-opcode
+	// counts in the fixture's _info.metadata.opcode_count. Works with any filler
+	// exposing debug_traceBlockByHash + JS tracer support (geth is validated).
+	if t.ExtractOpcodeCount != nil && *t.ExtractOpcodeCount {
+		args = append(args, "--extract-opcode-count")
+	}
+
 	if t.MaxGasPerTest != nil {
 		args = append(args, fmt.Sprintf("--max-gas-per-test=%d", *t.MaxGasPerTest))
 	}
