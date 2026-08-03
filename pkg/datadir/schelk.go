@@ -471,7 +471,7 @@ func repairStaleEraDevice(ctx context.Context, log logrus.FieldLogger, name stri
 	if err != nil {
 		return fmt.Errorf("opening schelk lock: %w", err)
 	}
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 
 	// Non-blocking: if schelk holds the lock it is still working, and the
 	// device is its own rather than an orphan.

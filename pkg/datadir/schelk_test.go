@@ -279,7 +279,7 @@ func TestRepairStaleEraDevice_RefusesWhileSchelkLockHeld(t *testing.T) {
 	// Hold the lock as a concurrent schelk process would.
 	held, err := os.OpenFile(SchelkLockPath(), os.O_RDWR|os.O_CREATE, 0o600)
 	require.NoError(t, err)
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 	require.NoError(t, syscall.Flock(int(held.Fd()), syscall.LOCK_EX|syscall.LOCK_NB))
 
 	repairErr := repairStaleEraDevice(context.Background(), logrus.New(), "bench_era")
