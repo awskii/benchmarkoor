@@ -20,6 +20,8 @@ export function useSuiteStats(suiteHash: string | undefined) {
           throw new Error(`Failed to fetch suite stats: ${response.status}`)
         }
 
+        // The API already excludes baseline rows by default; the client-side
+        // filter stays for rollout skew against older API deployments.
         const stats = (await response.json()) as SuiteStats
         return withoutBaselineTests(stats)
       }
