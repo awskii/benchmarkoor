@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchData } from '../client'
 import type { SuiteStats } from '../types'
 import { loadRuntimeConfig, isIndexingEnabled } from '@/config/runtime'
+import { withoutBaselineTests } from '@/utils/baselineTests'
 
 export function useSuiteStats(suiteHash: string | undefined) {
   return useQuery({
@@ -19,14 +20,15 @@ export function useSuiteStats(suiteHash: string | undefined) {
           throw new Error(`Failed to fetch suite stats: ${response.status}`)
         }
 
-        return response.json() as Promise<SuiteStats>
+        const stats = (await response.json()) as SuiteStats
+        return withoutBaselineTests(stats)
       }
 
       const { data, status } = await fetchData<SuiteStats>(`suites/${suiteHash}/stats.json`)
       if (!data) {
         throw new Error(`Failed to fetch suite stats: ${status}`)
       }
-      return data
+      return withoutBaselineTests(data)
     },
     enabled: !!suiteHash,
   })
