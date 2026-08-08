@@ -85,9 +85,14 @@ type BuilderConfig struct {
 	// CleanupOnStart removes any leftover benchmarkoor resources (containers,
 	// volumes, the build network, ZFS clones, overlay mounts, CPU-freq state)
 	// before the build starts. The analogue of runner.cleanup_on_start.
-	CleanupOnStart bool                `yaml:"cleanup_on_start" mapstructure:"cleanup_on_start"`
-	StateActor     *StateActorConfig   `yaml:"state_actor,omitempty" mapstructure:"state_actor"`
-	EESTPayloads   *EESTPayloadsConfig `yaml:"eest_payloads,omitempty" mapstructure:"eest_payloads"`
+	CleanupOnStart bool              `yaml:"cleanup_on_start" mapstructure:"cleanup_on_start"`
+	StateActor     *StateActorConfig `yaml:"state_actor,omitempty" mapstructure:"state_actor"`
+	// PreRuns is an optional stage that runs after StateActor and before
+	// EESTPayloads: it advances a snapshot datadir (gas-bump + funding block +
+	// fill-stateful on setup tests) and persists the result for EESTPayloads to
+	// build on. See PreRunsConfig.
+	PreRuns      *PreRunsConfig      `yaml:"pre_runs,omitempty" mapstructure:"pre_runs"`
+	EESTPayloads *EESTPayloadsConfig `yaml:"eest_payloads,omitempty" mapstructure:"eest_payloads"`
 }
 
 // StateActorConfig configures how the state-actor binary is invoked via
@@ -822,6 +827,26 @@ type EESTFixturesSource struct {
 	// Local tarball support (.tar.gz files).
 	LocalFixturesTarball string `yaml:"local_fixtures_tarball,omitempty" mapstructure:"local_fixtures_tarball"`
 	LocalGenesisTarball  string `yaml:"local_genesis_tarball,omitempty" mapstructure:"local_genesis_tarball"`
+	// PreRuns points at a builder.pre_runs bundle (engine_newPayload/
+	// forkchoiceUpdated request lines advancing a raw snapshot to the setup head).
+	// The runner replays it once per instance, before the benchmark fixtures, so
+	// every client reaches the setup state on its own raw snapshot — no per-client
+	// advanced datadirs. Already-applied blocks are skipped, so it is a no-op when
+	// the datadir is already advanced.
+	PreRuns *EESTPreRunsSource `yaml:"pre_runs,omitempty" mapstructure:"pre_runs"`
+}
+
+// PreRunBundleSubdir is the subdirectory (under a builder.pre_runs target's
+// output_dir) where the replayable payload bundle is written, and the default
+// EESTPreRunsSource.FixturesSubdir the runner reads it from.
+const PreRunBundleSubdir = "pre_run_bundle"
+
+// EESTPreRunsSource locates a builder.pre_runs payload bundle for the runner to
+// replay before the benchmark fixtures. It mirrors the fixtures source's local
+// layout: FixturesSubdir defaults to PreRunBundleSubdir.
+type EESTPreRunsSource struct {
+	LocalFixturesDir string `yaml:"local_fixtures_dir,omitempty" mapstructure:"local_fixtures_dir"`
+	FixturesSubdir   string `yaml:"fixtures_subdir,omitempty" mapstructure:"fixtures_subdir"`
 }
 
 // UseArtifacts returns true if the source is configured to use GitHub Actions artifacts.
@@ -1057,11 +1082,113 @@ type GenesisEIPOverride struct {
 	EIPs []uint64 `yaml:"eips" mapstructure:"eips"`
 }
 
+// SchelkOptions configures schelk-specific behaviour for a target whose
+// datadir_method is "schelk". It is rejected on any other method, since every
+// option here manipulates the schelk volumes directly.
+type SchelkOptions struct {
+	// Promote persists the advanced datadir as the new schelk VIRGIN baseline
+	// (`schelk promote`) once the pre-run finishes and its client has stopped.
+	//
+	// This is destructive and irreversible: the original snapshot baseline is
+	// overwritten and cannot be recovered without re-fetching it. In exchange,
+	// every later `schelk restore` lands on the advanced state, so downstream
+	// stages and runs need no bundle replay at all.
+	//
+	// It only ever runs after a graceful client shutdown. A client that had to be
+	// killed may not have flushed its state, and promoting a torn datadir would
+	// destroy the golden image in favour of an unusable one.
+	//
+	// Builder-side (builder.pre_runs.targets[].schelk_options) only.
+	Promote bool `yaml:"promote,omitempty" mapstructure:"promote"`
+
+	// PromotePostPreRuns is the runner-side counterpart: once the suite's pre-run
+	// steps have ALL succeeded, stop the client, promote the advanced datadir to
+	// the baseline, and remount. Every later `schelk restore` — including the
+	// per-test one a container-recreate rollback performs — then starts from the
+	// post-pre-run state, so the bundle never has to be replayed again.
+	//
+	// Runner-side (runner.client.config.datadirs.<client>.schelk_options) only.
+	// Carries the same irreversibility and graceful-shutdown caveats as Promote.
+	PromotePostPreRuns bool `yaml:"promote_post_pre_runs,omitempty" mapstructure:"promote_post_pre_runs"`
+}
+
+// PreRunPredeploy configures a pre-run that crosses a fork boundary at build
+// time: it boots the filler at PreFork (the fork the snapshot is at), deploys
+// Contracts via CREATE transactions on that fork, then lets the chain cross into
+// the target fork (builder.pre_runs.config.fork) at genesis_eip_override's
+// timestamp for the gas-bump and fill. This is how an osaka snapshot gets the
+// amsterdam system contracts (e.g. EIP-8282) deployed before amsterdam
+// activates, since a strict client rejects amsterdam blocks whose system
+// contracts have no code.
+type PreRunPredeploy struct {
+	// PreFork is the fork the snapshot boots at, used for the funding and deploy
+	// blocks built before the target fork activates (e.g. "osaka").
+	PreFork string `yaml:"pre_fork" mapstructure:"pre_fork"`
+	// DeployerKey is the 0x-prefixed private key that funds (via the pre-run
+	// funding block) and signs the CREATE transactions. Its contracts land at the
+	// CREATE addresses of this account at nonces 0..n-1.
+	DeployerKey string `yaml:"deployer_key" mapstructure:"deployer_key"`
+	// DeployerFundGwei is the withdrawal amount credited to the deployer in the
+	// funding block (default DefaultPreRunFundingAmountGwei).
+	DeployerFundGwei *uint64 `yaml:"deployer_fund_gwei,omitempty" mapstructure:"deployer_fund_gwei"`
+	// Contracts are the runtime bytecodes to deploy, in order.
+	Contracts []PreRunPredeployContract `yaml:"contracts" mapstructure:"contracts"`
+}
+
+// PreRunPredeployContract is one contract deployed by a PreRunPredeploy, in one
+// of two mutually exclusive forms.
+//
+// Code is 0x-prefixed RUNTIME bytecode. benchmarkoor wraps it in the minimal
+// returning init code and sends a plain CREATE from the deployer, so the
+// contract lands at a CREATE address derived from the deployer and its nonce.
+// That is fine when the fork's system-contract addresses are chainspec params,
+// but not when a client hardcodes them — the code never appears where the client
+// looks.
+//
+// To + Data + Address instead send a CALL: To is a contract that performs the
+// deployment (typically a CREATE2 factory such as the deterministic-deployment
+// proxy at 0x4e59b448…c0B4956C), Data is its calldata (for that factory,
+// 32-byte salt ‖ initcode), and Address is where the code must end up, verified
+// after the block is built. A CREATE2 address is
+// keccak256(0xff ‖ factory ‖ salt ‖ keccak256(initcode)) and does not involve
+// msg.sender, so replaying a network's own deployment calldata from any funded
+// sender reproduces the canonical predeploy address — which is what lets a
+// pre-run put e.g. the EIP-8282 request contracts exactly where clients
+// hardcode them. It also runs the real constructor, so constructor-initialised
+// storage (EIP-8282 sets excess = EXCESS_INHIBITOR) is set up as on the real
+// chain, unlike the Code form which installs runtime bytecode over empty
+// storage.
+//
+// The factory itself must already exist on the chain; a synthetic snapshot has
+// to predeploy it (state_actor's create2_factory template does).
+type PreRunPredeployContract struct {
+	Code    string `yaml:"code,omitempty" mapstructure:"code"`
+	To      string `yaml:"to,omitempty" mapstructure:"to"`
+	Data    string `yaml:"data,omitempty" mapstructure:"data"`
+	Address string `yaml:"address,omitempty" mapstructure:"address"`
+}
+
+// IsCall reports whether the contract is deployed by calling To (the CREATE2
+// factory form) rather than by a plain CREATE of Code.
+func (c *PreRunPredeployContract) IsCall() bool {
+	return c.To != ""
+}
+
 // DataDirConfig configures a pre-populated data directory for a client.
 type DataDirConfig struct {
 	SourceDir    string `yaml:"source_dir" json:"source_dir" mapstructure:"source_dir"`
 	ContainerDir string `yaml:"container_dir,omitempty" json:"container_dir,omitempty" mapstructure:"container_dir"`
 	Method       string `yaml:"method,omitempty" json:"method,omitempty" mapstructure:"method"`
+	// SchelkOptions configures schelk-specific behaviour; only valid when Method
+	// is "schelk".
+	SchelkOptions *SchelkOptions `yaml:"schelk_options,omitempty" json:"schelk_options,omitempty" mapstructure:"schelk_options"`
+}
+
+// ShouldPromotePostPreRuns reports whether this datadir should be promoted to
+// the schelk baseline once the suite's pre-run steps have all succeeded.
+func (d *DataDirConfig) ShouldPromotePostPreRuns() bool {
+	return d != nil && d.SchelkOptions != nil &&
+		d.SchelkOptions.PromotePostPreRuns && d.Method == "schelk"
 }
 
 // RetryNewPayloadsSyncingConfig configures retry behavior when engine_newPayload returns SYNCING.
@@ -1545,6 +1672,7 @@ func Load(paths ...string) (*Config, error) {
 
 	restoreEnvironmentKeyCasing(&cfg, rawYAMLs)
 	restoreAddressStubsKeyCasing(&cfg, rawYAMLs)
+	restorePreRunFillEnvKeyCasing(&cfg, rawYAMLs)
 	normalizeStateActorSpec(&cfg, rawYAMLs)
 
 	cfg.applyDefaults()
@@ -1772,6 +1900,19 @@ func (c *Config) applyDefaults() {
 
 		if c.Builder.EESTPayloads.JWT == "" {
 			c.Builder.EESTPayloads.JWT = DefaultJWT
+		}
+	}
+
+	// Apply builder.pre_runs defaults, mirroring eest_payloads: ContainerRuntime
+	// falls back at call time; JWT defaults to DefaultJWT so the filler client,
+	// benchmarkoor's own engine calls, and fill-stateful all share it.
+	if c.Builder != nil && c.Builder.PreRuns != nil {
+		if c.Builder.PreRuns.PullPolicy == "" {
+			c.Builder.PreRuns.PullPolicy = DefaultPullPolicy
+		}
+
+		if c.Builder.PreRuns.JWT == "" {
+			c.Builder.PreRuns.JWT = DefaultJWT
 		}
 	}
 }
@@ -2069,6 +2210,10 @@ func (c *Config) validateBuilder() error {
 		return err
 	}
 
+	if err := c.validatePreRuns(); err != nil {
+		return err
+	}
+
 	return c.validateEESTPayloads()
 }
 
@@ -2353,8 +2498,8 @@ func validateEESTPayloadPaths(t *EESTPayloadTarget, prefix string, seenOutputs m
 
 	seenOutputs[t.OutputDir] = i
 
-	if t.Genesis != "" && !filepath.IsAbs(t.Genesis) {
-		return fmt.Errorf("%s.genesis must be an absolute path, got %q", prefix, t.Genesis)
+	if t.Genesis != "" && !isHTTPURLRef(t.Genesis) && !filepath.IsAbs(t.Genesis) {
+		return fmt.Errorf("%s.genesis must be an absolute path or http(s) URL, got %q", prefix, t.Genesis)
 	}
 
 	// genesis_fork_override / genesis_eip_override patch the boot genesis, so
@@ -2427,6 +2572,12 @@ func validateFixedOpcodeCount(values *[]float64, prefix string) error {
 	}
 
 	return nil
+}
+
+// isHTTPURLRef reports whether s is an http(s) URL rather than a local path.
+// Genesis/chainspec refs may be either; the builder downloads URLs at build time.
+func isHTTPURLRef(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
 // validDataDirMethods mirrors the datadir.method vocabulary accepted by
@@ -3110,13 +3261,51 @@ func (c *Config) validateDataDirMethods(opt ValidateOpts) error {
 
 	var schelkInstances []schelkInstance
 
+	// There is one schelk volume per host, so a promote by one instance replaces
+	// the baseline every other instance restores from. Track who asks for it.
+	promoter := ""
+
 	for _, instance := range c.Runner.Instances {
 		if !opt.isInstanceActive(instance.ID) {
 			continue
 		}
 
 		dd := c.resolveDataDir(&instance)
-		if dd != nil && dd.Method == "schelk" {
+		if dd == nil {
+			continue
+		}
+
+		if dd.SchelkOptions != nil {
+			if dd.Method != "schelk" {
+				return fmt.Errorf(
+					"instance %q: datadir.schelk_options requires method: schelk, got %q",
+					instance.ID, dd.Method,
+				)
+			}
+
+			// `promote` is the builder-side spelling; accepting it here silently
+			// would look like it persists the datadir when nothing runs it.
+			if dd.SchelkOptions.Promote {
+				return fmt.Errorf(
+					"instance %q: datadir.schelk_options.promote is a builder.pre_runs option; "+
+						"the runner spelling is promote_post_pre_runs", instance.ID,
+				)
+			}
+		}
+
+		if dd.ShouldPromotePostPreRuns() {
+			if promoter != "" {
+				return fmt.Errorf(
+					"instance %q: datadir.schelk_options.promote_post_pre_runs is already set on "+
+						"instance %q, and both share the one schelk volume — only one may promote it",
+					instance.ID, promoter,
+				)
+			}
+
+			promoter = instance.ID
+		}
+
+		if dd.Method == "schelk" {
 			schelkInstances = append(schelkInstances, schelkInstance{
 				id:        instance.ID,
 				sourceDir: dd.SourceDir,

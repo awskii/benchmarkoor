@@ -4220,6 +4220,26 @@ func TestValidateEESTPayloads(t *testing.T) {
 			errSubstr: "output_dir must be an absolute path",
 		},
 		{
+			name: "genesis http url is valid",
+			ep: func() *EESTPayloadsConfig {
+				tgt := base(dirA)
+				tgt.Genesis = "https://example.com/chainspec.json"
+
+				return &EESTPayloadsConfig{FillImage: "fill:latest", Targets: []EESTPayloadTarget{tgt}}
+			}(),
+		},
+		{
+			name: "relative genesis path rejected",
+			ep: func() *EESTPayloadsConfig {
+				tgt := base(dirA)
+				tgt.Genesis = "relative/chainspec.json"
+
+				return &EESTPayloadsConfig{FillImage: "fill:latest", Targets: []EESTPayloadTarget{tgt}}
+			}(),
+			wantErr:   true,
+			errSubstr: "absolute path or http(s) URL",
+		},
+		{
 			name: "duplicate output_dir",
 			ep: &EESTPayloadsConfig{
 				FillImage: "fill:latest",
@@ -4486,4 +4506,38 @@ func TestEESTFixturesSource_UseFixturesURL(t *testing.T) {
 	require.NoError(t, (&EESTFixturesSource{
 		FixturesURL: "https://x/f.tar.gz", FixturesSubdir: "sub",
 	}).validate())
+}
+
+func TestDataDirShouldPromotePostPreRuns(t *testing.T) {
+	tests := []struct {
+		name string
+		dd   *DataDirConfig
+		want bool
+	}{
+		{
+			name: "schelk opting in",
+			dd:   &DataDirConfig{Method: "schelk", SchelkOptions: &SchelkOptions{PromotePostPreRuns: true}},
+			want: true,
+		},
+		{
+			name: "schelk opting out",
+			dd:   &DataDirConfig{Method: "schelk", SchelkOptions: &SchelkOptions{}},
+			want: false,
+		},
+		{
+			// Validation rejects this; the guard stops a hand-built config from
+			// promoting a volume schelk does not manage.
+			name: "another method never promotes",
+			dd:   &DataDirConfig{Method: "copy", SchelkOptions: &SchelkOptions{PromotePostPreRuns: true}},
+			want: false,
+		},
+		{name: "no options", dd: &DataDirConfig{Method: "schelk"}, want: false},
+		{name: "nil datadir", dd: nil, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.dd.ShouldPromotePostPreRuns())
+		})
+	}
 }

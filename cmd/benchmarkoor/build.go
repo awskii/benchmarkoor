@@ -24,8 +24,10 @@ import (
 var (
 	buildTargetFilter       []string
 	buildStateActorTargets  []string
+	buildPreRunTargets      []string
 	buildEESTPayloadTargets []string
 	buildSkipStateActor     bool
+	buildSkipPreRuns        bool
 	buildSkipEESTPayloads   bool
 	buildForce              bool
 	buildRebuildOnDiff      bool
@@ -39,13 +41,16 @@ var buildCmd = &cobra.Command{
 
   - builder.state_actor   materialises pre-populated client datadirs by invoking
                           state-actor (https://github.com/ethereum/state-actor).
+  - builder.pre_runs      advances a snapshot datadir (gas-bump + funding block +
+                          fill-stateful on setup tests) and persists the result for
+                          eest_payloads to build on. Optional.
   - builder.eest_payloads generates stateful EEST benchmark fixtures by running
                           fill-stateful against a filler client booted on a snapshot.
 
 Builds are decoupled from "benchmarkoor run": this command produces artifacts on
 disk that subsequent runs consume via their normal datadir.* / test source providers.
-Builders run in declaration order (state_actor before eest_payloads) so a fixture
-build can consume a datadir produced earlier in the same invocation.`,
+Builders run in declaration order (state_actor, then pre_runs, then eest_payloads)
+so a later builder can consume a datadir produced earlier in the same invocation.`,
 	RunE: runBuild,
 }
 
@@ -55,10 +60,14 @@ func init() {
 		"Only build targets whose name matches, across all builders (comma-separated or repeated)")
 	buildCmd.Flags().StringSliceVar(&buildStateActorTargets, "limit-state-actor-target", nil,
 		"Only build builder.state_actor targets whose name matches (comma-separated or repeated)")
+	buildCmd.Flags().StringSliceVar(&buildPreRunTargets, "limit-pre-runs-target", nil,
+		"Only build builder.pre_runs targets whose name matches (comma-separated or repeated)")
 	buildCmd.Flags().StringSliceVar(&buildEESTPayloadTargets, "limit-eest-payload-target", nil,
 		"Only build builder.eest_payloads targets whose name matches (comma-separated or repeated)")
 	buildCmd.Flags().BoolVar(&buildSkipStateActor, "skip-state-actor-build", false,
 		"Skip the builder.state_actor builder entirely")
+	buildCmd.Flags().BoolVar(&buildSkipPreRuns, "skip-pre-runs-build", false,
+		"Skip the builder.pre_runs builder entirely")
 	buildCmd.Flags().BoolVar(&buildSkipEESTPayloads, "skip-eest-payload-build", false,
 		"Skip the builder.eest_payloads builder entirely")
 	buildCmd.Flags().BoolVar(&buildForce, "force", false,
@@ -88,7 +97,7 @@ func runBuild(_ *cobra.Command, _ []string) error {
 	}
 
 	if cfg.Builder == nil ||
-		(cfg.Builder.StateActor == nil && cfg.Builder.EESTPayloads == nil) {
+		(cfg.Builder.StateActor == nil && cfg.Builder.PreRuns == nil && cfg.Builder.EESTPayloads == nil) {
 		return fmt.Errorf("no builders configured; nothing to build")
 	}
 
@@ -226,6 +235,31 @@ func buildBuilders(ctx context.Context, cfg *config.Config) ([]builder.Builder, 
 		builders = append(builders, builder.NewStateActorBuilder(log, cfg.Builder.StateActor, runtime, mgr))
 	}
 
+	if cfg.Builder.PreRuns != nil && buildSkipPreRuns {
+		log.Info("Skipping builder.pre_runs (--skip-pre-runs-build)")
+	}
+
+	if cfg.Builder.PreRuns != nil && !buildSkipPreRuns {
+		runtime := cfg.GetPreRunsContainerRuntime()
+
+		mgr, err := getManager(runtime)
+		if err != nil {
+			stop()
+
+			return nil, nil, err
+		}
+
+		cacheDir, err := cfg.ResolveCacheDir()
+		if err != nil {
+			stop()
+
+			return nil, nil, err
+		}
+
+		builders = append(builders,
+			builder.NewPreRunsBuilder(log, cfg.Builder.PreRuns, runtime, mgr, cacheDir))
+	}
+
 	if cfg.Builder.EESTPayloads != nil && buildSkipEESTPayloads {
 		log.Info("Skipping builder.eest_payloads (--skip-eest-payload-build)")
 	}
@@ -270,6 +304,7 @@ type buildResult struct {
 	name      string
 	client    string
 	outputDir string
+	bundleDir string
 	skipped   bool
 	err       error
 	elapsed   time.Duration
@@ -285,11 +320,54 @@ func runBuilders(ctx context.Context, builders []builder.Builder) error {
 
 	results := make([]buildResult, 0, len(targets))
 
+	// eest_payloads consumes the pre_runs output (its source_dir is a pre_runs
+	// target's output_dir), so a rebuilt pre-run invalidates any existing eest
+	// fixtures. If any pre_runs target actually builds (not skipped), force the
+	// eest_payloads targets to rebuild even when their output_dir looks populated.
+	// Targets run in declaration order (pre_runs before eest_payloads), so this is
+	// known by the time an eest_payloads target is reached.
+	preRunsBuilt := false
+
+	// eest_payloads fills against the datadir a pre_runs target advanced, so a
+	// failed pre-run leaves it pointing at an un-advanced snapshot. Building on
+	// that does not fail loudly — it silently fills against the wrong chain and
+	// emits fixtures that look valid — so a pre-run failure blocks every
+	// eest_payloads target instead.
+	var failedPreRuns []string
+
 	for _, sel := range targets {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+		}
+
+		if sel.builder.Name() == builder.EESTPayloadsBuilderName && len(failedPreRuns) > 0 {
+			blockErr := fmt.Errorf(
+				"not attempted: builder.pre_runs target(s) failed: %s", strings.Join(failedPreRuns, ", "),
+			)
+
+			log.WithField("target", sel.info.Name).WithError(blockErr).
+				Error("Skipping builder.eest_payloads target")
+
+			results = append(results, buildResult{
+				builder:   sel.builder.Name(),
+				name:      sel.info.Name,
+				client:    sel.info.Client,
+				outputDir: sel.info.OutputDir,
+				bundleDir: sel.info.BundleDir,
+				err:       blockErr,
+			})
+
+			continue
+		}
+
+		force := buildForce
+		if sel.builder.Name() == builder.EESTPayloadsBuilderName && preRunsBuilt {
+			force = true
+
+			log.WithField("target", sel.info.Name).
+				Info("Forcing builder.eest_payloads rebuild (a builder.pre_runs target was rebuilt)")
 		}
 
 		log.WithFields(logrus.Fields{
@@ -299,13 +377,23 @@ func runBuilders(ctx context.Context, builders []builder.Builder) error {
 		}).Info("Building target")
 
 		start := time.Now()
-		skipped, buildErr := sel.builder.Build(ctx, sel.info.Name, builder.BuildOptions{Force: buildForce, RebuildOnDiff: buildRebuildOnDiff})
+		skipped, buildErr := sel.builder.Build(ctx, sel.info.Name, builder.BuildOptions{Force: force, RebuildOnDiff: buildRebuildOnDiff})
+
+		if sel.builder.Name() == builder.PreRunsBuilderName {
+			switch {
+			case buildErr != nil:
+				failedPreRuns = append(failedPreRuns, sel.info.Name)
+			case !skipped:
+				preRunsBuilt = true
+			}
+		}
 
 		results = append(results, buildResult{
 			builder:   sel.builder.Name(),
 			name:      sel.info.Name,
 			client:    sel.info.Client,
 			outputDir: sel.info.OutputDir,
+			bundleDir: sel.info.BundleDir,
 			skipped:   skipped,
 			err:       buildErr,
 			elapsed:   time.Since(start),
@@ -345,11 +433,22 @@ func writeBuildSummaryJSON(path string, results []buildResult) error {
 			errMsg = r.err.Error()
 		}
 
+		// Describe the replay bundle from the sidecar the pre-run wrote beside it.
+		// Best-effort: a target that records no bundle yields nil, and a summary is
+		// not worth failing a build over.
+		bundleInfo, bundleErr := builder.ReadPreRunBundleInfo(r.bundleDir)
+		if bundleErr != nil {
+			log.WithError(bundleErr).WithField("target", r.name).
+				Warn("Could not read pre-run bundle metadata; omitting it from the summary")
+		}
+
 		targets = append(targets, executor.BuildTargetSummary{
 			Builder:   r.builder,
 			Name:      r.name,
 			Client:    r.client,
 			OutputDir: r.outputDir,
+			BundleDir: r.bundleDir,
+			Bundle:    bundleInfo,
 			Status:    status,
 			Error:     errMsg,
 			ElapsedMs: r.elapsed.Milliseconds(),
@@ -446,6 +545,7 @@ type builderFilter struct {
 func limitFilters(builders []builder.Builder) map[string]builderFilter {
 	all := map[string]builderFilter{
 		builder.StateActorBuilderName:   {flag: "--limit-state-actor-target", values: buildStateActorTargets},
+		builder.PreRunsBuilderName:      {flag: "--limit-pre-runs-target", values: buildPreRunTargets},
 		builder.EESTPayloadsBuilderName: {flag: "--limit-eest-payload-target", values: buildEESTPayloadTargets},
 	}
 

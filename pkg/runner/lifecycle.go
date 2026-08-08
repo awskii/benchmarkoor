@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ethpandaops/benchmarkoor/pkg/blocklog"
+	"github.com/ethpandaops/benchmarkoor/pkg/builder"
 	"github.com/ethpandaops/benchmarkoor/pkg/client"
 	"github.com/ethpandaops/benchmarkoor/pkg/config"
 	"github.com/ethpandaops/benchmarkoor/pkg/cpufreq"
@@ -908,48 +910,73 @@ func (r *runner) runContainerLifecycle(
 	var containerOOMKilled *bool
 	var mu sync.Mutex
 
-	containerExitCh, containerErrCh := r.containerMgr.WaitForContainerExit(
-		ctx, containerID,
-	)
+	// stoppingOnPurpose is set while the run itself stops the client — the schelk
+	// promote path does that mid-run. Without it the monitor below cannot tell a
+	// deliberate stop from a crash, and would cancel the very context the rest of
+	// the run executes under.
+	var stoppingOnPurpose bool
 
-	r.wg.Add(1)
+	isIntentional := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
 
-	go func() {
-		defer r.wg.Done()
+		return stoppingOnPurpose
+	}
 
-		select {
-		case exitInfo := <-containerExitCh:
-			mu.Lock()
-			containerDied = true
-			containerExitCode = &exitInfo.ExitCode
-			containerOOMKilled = &exitInfo.OOMKilled
-			mu.Unlock()
+	// armContainerMonitor watches id and fails the run if it dies unexpectedly.
+	// It is re-armed after a deliberate stop/start so the restarted client stays
+	// covered for the remainder of the run.
+	armContainerMonitor := func(id string) {
+		containerExitCh, containerErrCh := r.containerMgr.WaitForContainerExit(ctx, id)
 
-			logFields := logrus.Fields{
-				"exit_code":  exitInfo.ExitCode,
-				"oom_killed": exitInfo.OOMKilled,
-			}
+		r.wg.Add(1)
+
+		go func() {
+			defer r.wg.Done()
 
 			select {
-			case <-localCleanupStarted:
-				log.WithFields(logFields).Debug(
-					"Container stopped during cleanup",
-				)
-			default:
-				log.WithFields(logFields).Warn(
-					"Container exited unexpectedly",
-				)
-			}
+			case exitInfo := <-containerExitCh:
+				if isIntentional() {
+					log.WithField("exit_code", exitInfo.ExitCode).
+						Debug("Container stopped on purpose; monitor stood down")
 
-			execCancel()
-		case err := <-containerErrCh:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				log.WithError(err).Warn("Container wait error")
+					return
+				}
+
+				mu.Lock()
+				containerDied = true
+				containerExitCode = &exitInfo.ExitCode
+				containerOOMKilled = &exitInfo.OOMKilled
+				mu.Unlock()
+
+				logFields := logrus.Fields{
+					"exit_code":  exitInfo.ExitCode,
+					"oom_killed": exitInfo.OOMKilled,
+				}
+
+				select {
+				case <-localCleanupStarted:
+					log.WithFields(logFields).Debug(
+						"Container stopped during cleanup",
+					)
+				default:
+					log.WithFields(logFields).Warn(
+						"Container exited unexpectedly",
+					)
+				}
+
+				execCancel()
+			case err := <-containerErrCh:
+				if err != nil && !errors.Is(err, context.Canceled) {
+					log.WithError(err).Warn("Container wait error")
+				}
+			case <-r.done:
+				// Runner is stopping.
 			}
-		case <-r.done:
-			// Runner is stopping.
-		}
-	}()
+		}()
+	}
+
+	armContainerMonitor(containerID)
 
 	// Get container IP for health checks.
 	containerIP, err := r.containerMgr.GetContainerIP(
@@ -1013,6 +1040,28 @@ func (r *runner) runContainerLifecycle(
 
 	// Log the latest block info.
 	blockNum, blockHash, stateRoot, blkErr := r.getLatestBlock(execCtx, containerIP, spec.RPCPort())
+
+	// The replay skip below is by block NUMBER, so a datadir sitting at the right
+	// height on a different chain would silently skip and benchmark the wrong
+	// state. Check the hash too, against the range the bundle records.
+	// preRunsAlreadyApplied short-circuits the replay: the head is already the
+	// bundle's end block, so every line would be skipped anyway — and skipping
+	// them still means streaming the whole file, which for a multi-GB bundle costs
+	// minutes per run.
+	preRunsAlreadyApplied := false
+
+	if blkErr == nil {
+		applied, err := r.verifyPreRunBundleHead(log, blockNum, blockHash)
+		if err != nil {
+			return err
+		}
+
+		preRunsAlreadyApplied = applied
+	}
+
+	if preRunsAlreadyApplied {
+		log.Info("Pre-run bundle already applied to this datadir; skipping the replay")
+	}
 	if blkErr != nil {
 		log.WithError(blkErr).Warn("Failed to get latest block")
 	} else {
@@ -1160,6 +1209,63 @@ func (r *runner) runContainerLifecycle(
 			}
 		}
 
+		// Promote the schelk baseline for the strategies that keep this one client
+		// for the whole run (none, rpc-debug-setHead). The runner-level strategies
+		// below handle it themselves, next to their own snapshot/checkpoint, since
+		// they rebuild the container per test anyway.
+		skipPreRunSteps := preRunsAlreadyApplied
+
+		if datadirCfg.ShouldPromotePostPreRuns() && !isRunnerLevelStrategy(rollbackStrategy) &&
+			!preRunsAlreadyApplied {
+			// The log stream ends with the stopped container, so re-attach it to
+			// the restarted one; otherwise the client's logs for the entire
+			// benchmark phase — everything after the promote — are lost.
+			reattachLogs := func() {
+				logCtx, newLogCancel := context.WithCancel(ctx)
+				logCancel = newLogCancel
+				logDone = make(chan struct{})
+
+				r.wg.Add(1)
+
+				go func() {
+					defer r.wg.Done()
+					defer close(logDone)
+
+					if err := r.streamLogs(
+						logCtx, instance.ID, containerID, logFile, benchmarkoorLogFile,
+						&containerLogInfo{
+							Name:             containerName,
+							ContainerID:      containerID,
+							Image:            imageName,
+							GenesisGroupHash: params.GenesisGroupHash,
+						},
+						blockLogCollector,
+					); err != nil {
+						select {
+						case <-localCleanupStarted:
+							log.WithError(err).Debug("Log streaming stopped")
+						default:
+							log.WithError(err).Warn("Log streaming error")
+						}
+					}
+				}()
+			}
+
+			newIP, err := r.promoteSchelkInPlace(
+				execCtx, ctx, instance, spec, containerID, containerIP, runResultsDir,
+				blockNum, &stoppingOnPurpose, &mu, armContainerMonitor, reattachLogs,
+				&logDone, &logCancel, log,
+			)
+			if err != nil {
+				return fmt.Errorf("promoting schelk baseline after pre-run steps: %w", err)
+			}
+
+			if newIP != "" {
+				containerIP = newIP
+				skipPreRunSteps = true
+			}
+		}
+
 		isRunnerLevel := rollbackStrategy == config.RollbackStrategyContainerRecreate ||
 			rollbackStrategy == config.RollbackStrategyCheckpointRestore
 
@@ -1218,6 +1324,7 @@ func (r *runner) runContainerLifecycle(
 				PostTestSleepDuration:         r.cfg.FullConfig.GetPostTestSleepDuration(instance),
 				PreRunStepSleep:               r.cfg.PreRunStepSleep,
 				SkipUntilBlockNumber:          blockNum,
+				SkipPreRunSteps:               skipPreRunSteps,
 			}
 
 			result, execErr = r.executor.ExecuteTests(execCtx, execOpts)
@@ -1518,4 +1625,226 @@ func copyStateActorFiles(
 	}
 
 	log.WithField("count", copied).Debug("Copied state-actor provenance into run output")
+}
+
+// verifyPreRunBundleHead checks the datadir the client booted on against the
+// block range its pre-run bundle records, and fails the run when they disagree.
+//
+// The executor resumes a replay by block NUMBER alone, so without this a datadir
+// sitting at the right height on a different chain — a promoted baseline built
+// from a different bundle, or a re-fill that produced different blocks — skips
+// the replay silently and benchmarks the wrong state. Promoting makes
+// "already applied" the normal case, so this stops being hypothetical.
+//
+// A head at the bundle's end block means the pre-runs are already applied (the
+// replay then skips every line); at its start block means they are about to be.
+// Anything in between is a partially applied bundle, which the replay resumes
+// from. Only a hash mismatch at a block the bundle actually names is an error —
+// that is the case that cannot be anything but the wrong chain.
+func (r *runner) verifyPreRunBundleHead(
+	log logrus.FieldLogger, headNumber uint64, headHash string,
+) (bool, error) {
+	if r.cfg.FullConfig == nil {
+		return false, nil
+	}
+
+	src := r.cfg.FullConfig.Runner.Benchmark.Tests.Source.EESTFixtures
+	if src == nil || src.PreRuns == nil || src.PreRuns.LocalFixturesDir == "" {
+		return false, nil
+	}
+
+	info, err := builder.ReadPreRunBundleInfo(src.PreRuns.LocalFixturesDir)
+	if err != nil {
+		// Metadata is a convenience; an unreadable sidecar must not block a run
+		// that would otherwise replay correctly.
+		log.WithError(err).Warn("Could not read pre-run bundle metadata; skipping head verification")
+
+		return false, nil
+	}
+
+	if info == nil {
+		return false, nil
+	}
+
+	expect := func(want string, applied bool) (bool, error) {
+		if strings.EqualFold(headHash, want) {
+			log.WithFields(logrus.Fields{
+				"block":            headNumber,
+				"pre_runs_applied": applied,
+			}).Info("Datadir head matches the pre-run bundle")
+
+			return applied, nil
+		}
+
+		return false, fmt.Errorf(
+			"datadir head %d has hash %s but the pre-run bundle expects %s at that block — "+
+				"the datadir is on a different chain than the bundle was recorded against",
+			headNumber, headHash, want,
+		)
+	}
+
+	if headNumber == info.EndBlockNumber {
+		return expect(info.EndBlockHash, true)
+	}
+
+	// Info recovered from the bundle file knows only its end block, so the start
+	// and range checks below have nothing to compare against. The end-block check
+	// above is the one that matters — it is what skips the replay — and the replay
+	// itself still fails loudly if the head cannot be built on.
+	if info.Derived() {
+		log.WithFields(logrus.Fields{
+			"block": headNumber, "bundle_end": info.EndBlockNumber,
+		}).Info("Pre-run bundle has no metadata sidecar; head verified against its end block only")
+
+		return false, nil
+	}
+
+	if headNumber == info.StartBlockNumber {
+		return expect(info.StartBlockHash, false)
+	}
+
+	if headNumber > info.StartBlockNumber && headNumber < info.EndBlockNumber {
+		log.WithFields(logrus.Fields{
+			"block": headNumber, "bundle_start": info.StartBlockNumber, "bundle_end": info.EndBlockNumber,
+		}).Info("Datadir head is inside the pre-run bundle range; the replay will resume from it")
+
+		return false, nil
+	}
+
+	return false, fmt.Errorf(
+		"datadir head %d is outside the pre-run bundle range %d..%d — the bundle cannot be "+
+			"replayed onto this datadir",
+		headNumber, info.StartBlockNumber, info.EndBlockNumber,
+	)
+}
+
+// isRunnerLevelStrategy reports whether a rollback strategy rebuilds the client
+// between tests. Those strategies persist the schelk baseline themselves, next
+// to their own snapshot/checkpoint, because they have to bake the pre-run state
+// into whatever each test restores from.
+func isRunnerLevelStrategy(strategy string) bool {
+	return strategy == config.RollbackStrategyContainerRecreate ||
+		strategy == config.RollbackStrategyCheckpointRestore
+}
+
+// promoteSchelkInPlace applies the suite's pre-run steps, then persists the
+// resulting datadir as the new schelk baseline, for the strategies that keep one
+// client for the whole run (none, rpc-debug-setHead).
+//
+// `schelk promote` unmounts the volume, so the client cannot hold it: the client
+// is stopped, promoted, the volume remounted, and the SAME container started
+// again — restarting re-binds the mount from the host path, which now resolves to
+// the promoted volume. The container monitor is told the stop is deliberate and
+// re-armed afterwards, so a mid-run stop is not mistaken for a crash.
+//
+// Returns the restarted container's IP, or "" when nothing was promoted (so the
+// caller leaves the executor to run the pre-run steps as usual).
+func (r *runner) promoteSchelkInPlace(
+	execCtx, ctx context.Context,
+	instance *config.ClientInstance,
+	spec client.Spec,
+	containerID, containerIP, resultsDir string,
+	headNumber uint64,
+	stoppingOnPurpose *bool,
+	mu *sync.Mutex,
+	armContainerMonitor func(string),
+	reattachLogs func(),
+	logDone *chan struct{},
+	logCancel *context.CancelFunc,
+	log logrus.FieldLogger,
+) (string, error) {
+	preRunOpts := &executor.ExecuteOptions{
+		EngineEndpoint: fmt.Sprintf(
+			"http://%s:%d", containerIP, spec.EnginePort(),
+		),
+		JWT:                           r.cfg.JWT,
+		ResultsDir:                    resultsDir,
+		FailFast:                      true,
+		PreRunStepSleep:               r.cfg.PreRunStepSleep,
+		SkipUntilBlockNumber:          headNumber,
+		RetryNewPayloadsSyncingConfig: r.cfg.FullConfig.GetRetryNewPayloadsSyncingState(instance),
+		RetryNewPayloadsFailedConfig:  r.cfg.FullConfig.GetRetryNewPayloadsFailedState(instance),
+	}
+
+	n, err := r.executor.RunPreRunSteps(execCtx, preRunOpts)
+	if err != nil {
+		return "", fmt.Errorf("running pre-run steps: %w", err)
+	}
+
+	if n == 0 {
+		log.Warn(
+			"promote_post_pre_runs is set but the suite has no pre-run steps; " +
+				"refusing to promote (the baseline would be the raw snapshot)",
+		)
+
+		return "", nil
+	}
+
+	log.WithField("steps", n).Info("Pre-run steps completed; promoting datadir to the schelk baseline")
+
+	log.WithField("settle", schelkSettleBeforeStop).Info("Waiting for client to settle before stop")
+	time.Sleep(schelkSettleBeforeStop)
+
+	mu.Lock()
+	*stoppingOnPurpose = true
+	mu.Unlock()
+
+	defer func() {
+		mu.Lock()
+		*stoppingOnPurpose = false
+		mu.Unlock()
+	}()
+
+	// Default (60s) SIGTERM grace so the client persists its state cleanly; a
+	// killed client may not have flushed, and that datadir must not become the
+	// irreversible golden image.
+	log.Info("Stopping client for schelk promote (graceful)")
+
+	if err := r.containerMgr.StopContainer(ctx, containerID, nil); err != nil {
+		return "", fmt.Errorf("stopping container: %w", err)
+	}
+
+	// Let the stopped container's logs finish landing before promoting.
+	waitForLogDrain(logDone, logCancel, logDrainTimeout)
+
+	if syncErr := exec.Command("sync").Run(); syncErr != nil {
+		log.WithError(syncErr).Warn("Failed to sync before schelk promote")
+	}
+
+	log.Info("Persisting the advanced datadir as the new schelk baseline (`schelk promote`)")
+
+	if err := datadir.SchelkPromote(ctx, r.log); err != nil {
+		return "", fmt.Errorf("schelk promote: %w", err)
+	}
+
+	// promote leaves the volume unmounted; the restarted container binds this path.
+	if err := datadir.EnsureSchelkMounted(ctx, r.log); err != nil {
+		return "", fmt.Errorf("remounting schelk volume after promote: %w", err)
+	}
+
+	log.Info("Restarting client on the promoted baseline")
+
+	if err := r.containerMgr.StartContainer(ctx, containerID); err != nil {
+		return "", fmt.Errorf("restarting container after promote: %w", err)
+	}
+
+	mu.Lock()
+	*stoppingOnPurpose = false
+	mu.Unlock()
+
+	armContainerMonitor(containerID)
+	reattachLogs()
+
+	newIP, err := r.containerMgr.GetContainerIP(ctx, containerID, r.cfg.ContainerNetwork)
+	if err != nil {
+		return "", fmt.Errorf("getting container IP after promote: %w", err)
+	}
+
+	if _, err := r.waitForRPC(execCtx, newIP, spec.RPCPort()); err != nil {
+		return "", fmt.Errorf("waiting for RPC after promote: %w", err)
+	}
+
+	log.WithField("ip", newIP).Info("Client back up on the promoted baseline")
+
+	return newIP, nil
 }
