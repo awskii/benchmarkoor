@@ -143,6 +143,12 @@ type Config struct {
 	ResultsOwner                    *fsutil.OwnerConfig // Optional file ownership for results directory
 	SystemResourceCollectionEnabled bool                // Enable system resource collection (cgroups/Docker Stats)
 	GitHubToken                     string              // Optional GitHub token for API-based artifact downloads
+	// RemoteSuiteSummary returns the summary.json remote storage already holds
+	// for a suite hash, or nil when there is none. A worker whose results
+	// directory is wiped between jobs — every CI runner — has no local suite to
+	// merge into, so without this it regenerates the summary from scratch and
+	// overwrites whatever the store had learned from richer runs.
+	RemoteSuiteSummary func(ctx context.Context, hash string) ([]byte, error)
 }
 
 // NewExecutor creates a new executor instance.
@@ -227,7 +233,7 @@ func (e *executor) Start(ctx context.Context) error {
 
 	// Create suite output if results directory is configured.
 	if e.cfg.ResultsDir != "" {
-		if err := e.createSuiteOutput(); err != nil {
+		if err := e.createSuiteOutput(ctx); err != nil {
 			return fmt.Errorf("creating suite output: %w", err)
 		}
 	}
@@ -236,7 +242,7 @@ func (e *executor) Start(ctx context.Context) error {
 }
 
 // createSuiteOutput computes hash and creates suite directory.
-func (e *executor) createSuiteOutput() error {
+func (e *executor) createSuiteOutput(ctx context.Context) error {
 	// Compute suite hash from file contents.
 	hash, err := ComputeSuiteHash(e.prepared)
 	if err != nil {
@@ -259,8 +265,12 @@ func (e *executor) createSuiteOutput() error {
 		Metadata: e.cfg.Metadata,
 	}
 
-	// Create suite output directory.
-	if err := CreateSuiteOutput(e.log, e.cfg.ResultsDir, hash, suiteInfo, e.prepared, e.cfg.ResultsOwner); err != nil {
+	// Create suite output directory, merging into what the store already knows
+	// for this hash so a run on a wiped worker enriches rather than replaces.
+	if err := CreateSuiteOutput(
+		e.log, e.cfg.ResultsDir, hash, suiteInfo, e.prepared, e.cfg.ResultsOwner,
+		e.remoteSuiteSummary(ctx, hash),
+	); err != nil {
 		return fmt.Errorf("creating suite output: %w", err)
 	}
 
@@ -271,6 +281,25 @@ func (e *executor) createSuiteOutput() error {
 	}).Info("Suite output created")
 
 	return nil
+}
+
+// remoteSuiteSummary fetches the stored summary for a hash. A failure is not
+// fatal: it costs the merge, and the run still writes a summary built from what
+// it knows, exactly as it did before this existed.
+func (e *executor) remoteSuiteSummary(ctx context.Context, hash string) []byte {
+	if e.cfg.RemoteSuiteSummary == nil {
+		return nil
+	}
+
+	data, err := e.cfg.RemoteSuiteSummary(ctx, hash)
+	if err != nil {
+		e.log.WithError(err).WithField("hash", hash).
+			Warn("Failed to read stored suite summary; building it from this run alone")
+
+		return nil
+	}
+
+	return data
 }
 
 // Stop cleans up the executor.

@@ -101,6 +101,19 @@ type SuiteTest struct {
 	TxCounts *TxCounts `json:"tx_counts,omitempty"`
 }
 
+// validSummary reports whether data is a summary.json describing a built
+// suite. A bare or truncated one carries no tests and must not be merged into
+// — that is what leaves "tests": null behind.
+func validSummary(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+
+	var s SuiteInfo
+
+	return json.Unmarshal(data, &s) == nil && len(s.Tests) > 0
+}
+
 // ComputeSuiteHash computes a hash of all test file contents.
 func ComputeSuiteHash(prepared *PreparedSource) (string, error) {
 	h := sha256.New()
@@ -159,25 +172,40 @@ func getStepContent(step *StepFile) ([]byte, error) {
 }
 
 // CreateSuiteOutput creates the suite directory structure with copied files and summary.
+// remoteSummary is the summary.json already held by remote storage for this
+// hash, or nil. It seeds the merge on workers whose results directory does not
+// survive between jobs; the files still get materialised either way.
 func CreateSuiteOutput(
 	log logrus.FieldLogger,
 	resultsDir, hash string,
 	info *SuiteInfo,
 	prepared *PreparedSource,
 	owner *fsutil.OwnerConfig,
+	remoteSummary []byte,
 ) error {
 	suiteDir := filepath.Join(resultsDir, "suites", hash)
-
-	suiteExists := false
 
 	// Treat the suite as already built only when a complete summary.json with
 	// tests is present. A bare or partial directory — e.g. left behind by a run
 	// that aborted mid-creation — must be rebuilt; otherwise info.Tests stays
 	// nil and summary.json gets (re)written with "tests": null.
-	if data, err := os.ReadFile(filepath.Join(suiteDir, "summary.json")); err == nil {
-		var existing SuiteInfo
-		if json.Unmarshal(data, &existing) == nil && len(existing.Tests) > 0 {
-			suiteExists = true
+	localSummary, _ := os.ReadFile(filepath.Join(suiteDir, "summary.json"))
+	suiteExists := validSummary(localSummary)
+
+	// What to merge into: this worker's own copy when it has one, otherwise
+	// whatever the store holds. Whether the files need materialising is a
+	// separate question, decided by suiteExists alone — a stored summary says
+	// nothing about what is on local disk.
+	baseline := localSummary
+
+	if !suiteExists {
+		baseline = nil
+
+		if validSummary(remoteSummary) {
+			baseline = remoteSummary
+
+			log.WithField("bytes", len(remoteSummary)).
+				Debug("Merging into the stored suite summary")
 		}
 	}
 
@@ -335,37 +363,37 @@ func CreateSuiteOutput(
 	// runs without affecting the suite hash, so we update it every time.
 	summaryPath := filepath.Join(suiteDir, "summary.json")
 
-	// If the suite already existed, read the existing summary to preserve
-	// test/step file references, then overlay the new info fields.
-	if suiteExists {
-		existingData, readErr := os.ReadFile(summaryPath)
-		if readErr == nil {
-			var existing SuiteInfo
-			if jsonErr := json.Unmarshal(existingData, &existing); jsonErr == nil {
+	// Overlay the new info onto the prior summary — the local one when this
+	// worker already built the suite, otherwise the stored one — so fields an
+	// earlier run derived from richer inputs survive.
+	if baseline != nil {
+		var existing SuiteInfo
+		if jsonErr := json.Unmarshal(baseline, &existing); jsonErr == nil {
+			if len(existing.PreRunSteps) > 0 {
 				info.PreRunSteps = existing.PreRunSteps
-
-				// Merge opcode data from prepared tests into existing entries.
-				mergeOpcodeData(existing.Tests, prepared)
-
-				lineProvider := func(testName string, step StepKind) []string {
-					reqPath := filepath.Join(suiteDir, sanitizeResultPath(testName), string(step)+".request")
-					data, err := os.ReadFile(reqPath)
-					if err != nil {
-						// Missing files are normal — most tests don't have setup/cleanup.
-						// Only warn for the test step where absence is genuinely unexpected.
-						if step == StepKindTest && !os.IsNotExist(err) {
-							log.WithError(err).WithField("path", reqPath).Warn("Failed to read test.request for payload-size merge")
-						}
-						return nil
-					}
-					return splitNonEmptyLines(string(data))
-				}
-
-				MergePayloadSizes(log, existing.Tests, lineProvider)
-				MergeTxCounts(log, existing.Tests, lineProvider)
-
-				info.Tests = existing.Tests
 			}
+
+			// Merge opcode data from prepared tests into existing entries.
+			mergeOpcodeData(existing.Tests, prepared)
+
+			lineProvider := func(testName string, step StepKind) []string {
+				reqPath := filepath.Join(suiteDir, sanitizeResultPath(testName), string(step)+".request")
+				data, err := os.ReadFile(reqPath)
+				if err != nil {
+					// Missing files are normal — most tests don't have setup/cleanup.
+					// Only warn for the test step where absence is genuinely unexpected.
+					if step == StepKindTest && !os.IsNotExist(err) {
+						log.WithError(err).WithField("path", reqPath).Warn("Failed to read test.request for payload-size merge")
+					}
+					return nil
+				}
+				return splitNonEmptyLines(string(data))
+			}
+
+			MergePayloadSizes(log, existing.Tests, lineProvider)
+			MergeTxCounts(log, existing.Tests, lineProvider)
+
+			info.Tests = existing.Tests
 		}
 	}
 

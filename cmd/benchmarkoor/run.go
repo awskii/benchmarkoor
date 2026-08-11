@@ -256,6 +256,7 @@ func runBenchmark(cmd *cobra.Command, args []string) error {
 				ResultsOwner:                    resultsOwner,
 				SystemResourceCollectionEnabled: *cfg.Runner.Benchmark.SystemResourceCollectionEnabled,
 				GitHubToken:                     cfg.Runner.GitHubToken,
+				RemoteSuiteSummary:              remoteSuiteSummaryFetcher(log, cfg),
 			}
 
 			exec = executor.NewExecutor(log, execCfg)
@@ -441,6 +442,35 @@ func generateResultsIndex(
 			"unsupported generate_results_index_method %q (use \"local\" or \"s3\")",
 			method,
 		)
+	}
+}
+
+// remoteSuiteSummaryFetcher returns a reader for the summary.json already in
+// the bucket for a suite hash, or nil when S3 upload is not configured. A CI
+// worker starts every job with an empty results directory, so without this the
+// suite summary is rebuilt from that run alone and overwrites the stored one.
+func remoteSuiteSummaryFetcher(
+	log logrus.FieldLogger,
+	cfg *config.Config,
+) func(context.Context, string) ([]byte, error) {
+	if cfg.Runner.Benchmark.ResultsUpload == nil ||
+		cfg.Runner.Benchmark.ResultsUpload.S3 == nil ||
+		!cfg.Runner.Benchmark.ResultsUpload.S3.Enabled {
+		return nil
+	}
+
+	s3Cfg := cfg.Runner.Benchmark.ResultsUpload.S3
+
+	prefix := s3Cfg.Prefix
+	if prefix == "" {
+		prefix = "results"
+	}
+
+	reader := upload.NewS3Reader(log, s3Cfg)
+	suitesBase := strings.TrimRight(prefix, "/") + "/suites/"
+
+	return func(ctx context.Context, hash string) ([]byte, error) {
+		return reader.GetObject(ctx, suitesBase+hash+"/summary.json")
 	}
 }
 
