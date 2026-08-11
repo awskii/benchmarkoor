@@ -72,6 +72,11 @@ type SourceStepsGlobs struct {
 // SuiteFile represents a file in the suite output.
 type SuiteFile struct {
 	OgPath string `json:"og_path"` // original relative path
+	// SizeBytes is the source file's size, recorded even when it was omitted.
+	SizeBytes int64 `json:"size_bytes,omitempty"`
+	// Omitted marks a payload too large to keep, so never uploaded. The UI
+	// must not offer it; the bytes stay in the fixtures artifact.
+	Omitted bool `json:"omitted,omitempty"`
 }
 
 // SuiteTestEEST contains EEST-specific metadata for a test.
@@ -159,12 +164,15 @@ func getStepContent(step *StepFile) ([]byte, error) {
 }
 
 // CreateSuiteOutput creates the suite directory structure with copied files and summary.
+// maxPreRunUploadSize caps the pre-run payloads kept, and so uploaded; see
+// config.ResultsUploadConfig.MaxPreRunUploadSize. Zero or less keeps every one.
 func CreateSuiteOutput(
 	log logrus.FieldLogger,
 	resultsDir, hash string,
 	info *SuiteInfo,
 	prepared *PreparedSource,
 	owner *fsutil.OwnerConfig,
+	maxPreRunUploadSize int64,
 ) error {
 	suiteDir := filepath.Join(resultsDir, "suites", hash)
 
@@ -203,7 +211,7 @@ func CreateSuiteOutput(
 		// Copy pre-run steps.
 		// Structure: <suite_dir>/<step_name>/pre_run.request (same pattern as tests).
 		for _, f := range prepared.PreRunSteps {
-			suiteFile, err := copyPreRunStepFile(suiteDir, f, owner)
+			suiteFile, err := copyPreRunStepFile(log, suiteDir, f, owner, maxPreRunUploadSize)
 			if err != nil {
 				return fmt.Errorf("copying pre-run step: %w", err)
 			}
@@ -419,7 +427,32 @@ func copyTestStepFile(testDir, stepType string, file *StepFile, owner *fsutil.Ow
 
 // copyPreRunStepFile copies a pre-run step file to the suite directory.
 // Files are stored as <suite_dir>/<step_name>/pre_run.request (same pattern as tests).
-func copyPreRunStepFile(suiteDir string, file *StepFile, owner *fsutil.OwnerConfig) (*SuiteFile, error) {
+// Over maxSize a file is described in the summary but not copied, so never
+// uploaded either; maxSize <= 0 disables the limit.
+func copyPreRunStepFile(
+	log logrus.FieldLogger,
+	suiteDir string,
+	file *StepFile,
+	owner *fsutil.OwnerConfig,
+	maxSize int64,
+) (*SuiteFile, error) {
+	size, err := stepSize(file)
+	if err != nil {
+		return nil, err
+	}
+
+	// Checked before anything is created: no wasted write, and no empty
+	// directory implying a file that was never stored.
+	if maxSize > 0 && size > maxSize {
+		log.WithFields(logrus.Fields{
+			"step":  file.Name,
+			"bytes": size,
+			"max":   maxSize,
+		}).Info("Pre-run bundle over the size limit; describing it in the suite without storing it")
+
+		return &SuiteFile{OgPath: file.Name, SizeBytes: size, Omitted: true}, nil
+	}
+
 	// Create step directory using the step name (relative path).
 	stepDir := filepath.Join(suiteDir, file.Name)
 	if err := fsutil.MkdirAll(stepDir, 0755, owner); err != nil {
@@ -434,7 +467,7 @@ func copyPreRunStepFile(suiteDir string, file *StepFile, owner *fsutil.OwnerConf
 			return nil, fmt.Errorf("writing content: %w", err)
 		}
 
-		return &SuiteFile{OgPath: file.Name}, nil
+		return &SuiteFile{OgPath: file.Name, SizeBytes: size}, nil
 	}
 
 	// Handle file-based steps.
@@ -456,7 +489,21 @@ func copyPreRunStepFile(suiteDir string, file *StepFile, owner *fsutil.OwnerConf
 		return nil, fmt.Errorf("copying content: %w", err)
 	}
 
-	return &SuiteFile{OgPath: file.Name}, nil
+	return &SuiteFile{OgPath: file.Name, SizeBytes: size}, nil
+}
+
+// stepSize reports a step's payload size without reading a file-backed one.
+func stepSize(file *StepFile) (int64, error) {
+	if file.Provider != nil {
+		return int64(len(file.Provider.Content())), nil
+	}
+
+	stat, err := os.Stat(file.Path)
+	if err != nil {
+		return 0, fmt.Errorf("stating source: %w", err)
+	}
+
+	return stat.Size(), nil
 }
 
 // GetGitCommitSHA retrieves the current commit SHA from a git repository.
