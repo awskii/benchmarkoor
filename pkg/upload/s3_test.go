@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -96,6 +98,21 @@ type fakeS3 struct {
 	singlePuts []string
 	multiparts []string
 	parts      int
+	// stored mimics bucket contents so ListObjectsV2 can report them back.
+	stored    map[string]int64
+	partBytes map[string]int64
+}
+
+func newFakeS3() *fakeS3 {
+	return &fakeS3{
+		stored:    make(map[string]int64),
+		partBytes: make(map[string]int64),
+	}
+}
+
+// store records an object under its bucket-relative key. Callers hold f.mu.
+func (f *fakeS3) store(path string, size int64) {
+	f.stored[strings.TrimPrefix(path, "/b/")] = size
 }
 
 func (f *fakeS3) handler() http.Handler {
@@ -107,6 +124,19 @@ func (f *fakeS3) handler() http.Handler {
 		defer f.mu.Unlock()
 
 		switch {
+		case r.Method == http.MethodGet && q.Get("list-type") == "2":
+			w.Header().Set("Content-Type", "application/xml")
+
+			body := `<ListBucketResult><IsTruncated>false</IsTruncated>`
+
+			for k, size := range f.stored {
+				if strings.HasPrefix(k, q.Get("prefix")) {
+					body += `<Contents><Key>` + k +
+						`</Key><Size>` + strconv.FormatInt(size, 10) + `</Size></Contents>`
+				}
+			}
+
+			_, _ = w.Write([]byte(body + `</ListBucketResult>`))
 		case r.Method == http.MethodPost && q.Has("uploads"):
 			w.Header().Set("Content-Type", "application/xml")
 			f.multiparts = append(f.multiparts, key)
@@ -114,17 +144,22 @@ func (f *fakeS3) handler() http.Handler {
 				`<Bucket>b</Bucket><Key>` + key + `</Key><UploadId>up-1</UploadId>` +
 				`</InitiateMultipartUploadResult>`))
 		case r.Method == http.MethodPut && q.Has("partNumber"):
-			_, _ = io.Copy(io.Discard, r.Body)
+			n, _ := io.Copy(io.Discard, r.Body)
 			f.parts++
+			f.partBytes[key] += n
 			w.Header().Set("ETag", `"etag"`)
 		case r.Method == http.MethodPost && q.Has("uploadId"):
 			w.Header().Set("Content-Type", "application/xml")
+
+			f.store(key, f.partBytes[key])
+
 			_, _ = w.Write([]byte(`<CompleteMultipartUploadResult>` +
 				`<Bucket>b</Bucket><Key>` + key + `</Key><ETag>"etag"</ETag>` +
 				`</CompleteMultipartUploadResult>`))
 		case r.Method == http.MethodPut:
-			_, _ = io.Copy(io.Discard, r.Body)
+			n, _ := io.Copy(io.Discard, r.Body)
 			f.singlePuts = append(f.singlePuts, key)
+			f.store(key, n)
 			w.Header().Set("ETag", `"etag"`)
 		default:
 			w.WriteHeader(http.StatusNotImplemented)
@@ -136,7 +171,7 @@ func (f *fakeS3) handler() http.Handler {
 // PutObject caps at 5 GiB and fails with EntityTooLarge on the multi-GB
 // pre-run bundles a stateful suite carries.
 func TestUploadFileSplitsLargeFiles(t *testing.T) {
-	fake := &fakeS3{}
+	fake := newFakeS3()
 	srv := httptest.NewServer(fake.handler())
 
 	defer srv.Close()
@@ -172,4 +207,55 @@ func TestUploadFileSplitsLargeFiles(t *testing.T) {
 	assert.Equal(t, []string{"/b/suites/h/big.bin"}, fake.multiparts)
 	assert.Equal(t, 2, fake.parts)
 	assert.Equal(t, []string{"/b/suites/h/small.bin"}, fake.singlePuts)
+}
+
+// A suite directory is content-addressed by its hash, so re-uploading it on
+// every run re-sends bytes the bucket already holds — for a stateful suite
+// that is ~12 GB a run, most of it one pre-run bundle.
+func TestUploadSuiteDirSkipsUnchangedObjects(t *testing.T) {
+	fake := newFakeS3()
+	srv := httptest.NewServer(fake.handler())
+
+	defer srv.Close()
+
+	uploader, err := NewS3Uploader(logrus.New(), &config.S3UploadConfig{
+		Bucket:          "b",
+		EndpointURL:     srv.URL,
+		Region:          "us-east-1",
+		AccessKeyID:     "id",
+		SecretAccessKey: "secret",
+		ForcePathStyle:  true,
+		ParallelUploads: 4,
+		Prefix:          "results",
+	})
+	require.NoError(t, err)
+
+	dir := filepath.Join(t.TempDir(), "0d93b5bf3b970403")
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "benchmark", "t1"), 0o750))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, ".eest-meta"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "benchmark", "t1", "test.request"), []byte("payload"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".eest-meta", "fixtures.ini"), []byte("meta"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "summary.json"), []byte(`{"hash":"x"}`), 0o600))
+
+	require.NoError(t, uploader.UploadSuiteDir(t.Context(), dir))
+	assert.Len(t, fake.singlePuts, 3, "first upload sends every file")
+
+	fake.singlePuts = nil
+
+	require.NoError(t, uploader.UploadSuiteDir(t.Context(), dir))
+
+	// summary.json is rewritten every run — labels change without changing the
+	// suite hash — so it alone is re-sent.
+	assert.Equal(t, []string{"/b/results/suites/0d93b5bf3b970403/summary.json"}, fake.singlePuts)
+
+	// A file whose size no longer matches is re-sent. Same size with different
+	// bytes is deliberately not detected: a suite key is content-addressed, so
+	// that cannot happen without the hash changing too.
+	fake.singlePuts = nil
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "benchmark", "t1", "test.request"), []byte("longer payload"), 0o600))
+	require.NoError(t, uploader.UploadSuiteDir(t.Context(), dir))
+	assert.ElementsMatch(t, []string{
+		"/b/results/suites/0d93b5bf3b970403/summary.json",
+		"/b/results/suites/0d93b5bf3b970403/benchmark/t1/test.request",
+	}, fake.singlePuts)
 }

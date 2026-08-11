@@ -113,6 +113,7 @@ func (u *s3Uploader) Preflight(ctx context.Context) error {
 type uploadJob struct {
 	localPath string
 	key       string
+	size      int64
 }
 
 // Upload walks localDir and uploads all files to S3 under the configured prefix.
@@ -149,6 +150,7 @@ func (u *s3Uploader) collectJobs(localDir, keyPrefix string) ([]uploadJob, error
 		jobs = append(jobs, uploadJob{
 			localPath: path,
 			key:       keyPrefix + "/" + filepath.ToSlash(relPath),
+			size:      info.Size(),
 		})
 
 		return nil
@@ -302,7 +304,9 @@ func (u *s3Uploader) resolvePrefix(baseName string) string {
 }
 
 // UploadSuiteDir uploads all files in a suite directory to S3 under
-// prefix + "/suites/" + dirname.
+// prefix + "/suites/" + dirname. Objects already there at the same size are
+// skipped: a suite hash is a digest of its step file contents, so a given key
+// under it always holds the same bytes and re-sending them is pure waste.
 func (u *s3Uploader) UploadSuiteDir(ctx context.Context, localSuiteDir string) error {
 	prefix := u.cfg.Prefix
 	if prefix == "" {
@@ -316,7 +320,77 @@ func (u *s3Uploader) UploadSuiteDir(ctx context.Context, localSuiteDir string) e
 		return fmt.Errorf("walking suite directory %s: %w", localSuiteDir, err)
 	}
 
-	return u.uploadJobs(ctx, jobs, keyPrefix)
+	remote, err := u.listSizes(ctx, keyPrefix)
+	if err != nil {
+		// A listing failure only costs us the optimisation, so fall back to
+		// uploading everything rather than failing the suite.
+		u.log.WithError(err).WithField("prefix", keyPrefix).
+			Warn("Failed to list existing suite objects; uploading all files")
+
+		return u.uploadJobs(ctx, jobs, keyPrefix)
+	}
+
+	pending := make([]uploadJob, 0, len(jobs))
+
+	var skipped, skippedBytes int64
+
+	for _, job := range jobs {
+		// summary.json is rewritten every run — metadata labels change without
+		// affecting the suite hash — so it is the one file never skipped.
+		if size, ok := remote[job.key]; ok && size == job.size &&
+			filepath.Base(job.key) != suiteSummaryFile {
+			skipped++
+			skippedBytes += job.size
+
+			continue
+		}
+
+		pending = append(pending, job)
+	}
+
+	if skipped > 0 {
+		u.log.WithFields(logrus.Fields{
+			"skipped":       skipped,
+			"skipped_bytes": skippedBytes,
+			"pending":       len(pending),
+			"prefix":        keyPrefix,
+		}).Info("Skipping suite objects already present at the same size")
+	}
+
+	return u.uploadJobs(ctx, pending, keyPrefix)
+}
+
+// suiteSummaryFile is the one file in a suite directory that is rewritten
+// rather than content-addressed.
+const suiteSummaryFile = "summary.json"
+
+// listSizes returns the size of every object under prefix, keyed by full key.
+func (u *s3Uploader) listSizes(
+	ctx context.Context, prefix string,
+) (map[string]int64, error) {
+	sizes := make(map[string]int64)
+
+	paginator := s3.NewListObjectsV2Paginator(u.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(u.cfg.Bucket),
+		Prefix: aws.String(prefix + "/"),
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("listing objects under %q: %w", prefix, err)
+		}
+
+		for _, obj := range page.Contents {
+			if obj.Key == nil || obj.Size == nil {
+				continue
+			}
+
+			sizes[*obj.Key] = *obj.Size
+		}
+	}
+
+	return sizes, nil
 }
 
 // detectContentType returns a MIME type based on file extension.
