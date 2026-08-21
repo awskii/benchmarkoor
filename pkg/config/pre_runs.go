@@ -30,6 +30,18 @@ const (
 	// funding account when amount_gwei is unset: the max uint64 (2^64-1) gwei,
 	// mirroring NethermindEth/gas-benchmarks' funding block.
 	DefaultPreRunFundingAmountGwei uint64 = 1<<64 - 1
+
+	// DefaultPreRunEOAStart is the fill-stateful --eoa-start value for a pre-run
+	// that leaves eoa_start unset. It sits a billion keys above DefaultEOAStart
+	// on purpose: the pre-run advances a datadir that a later eest_payloads fill
+	// then fills on top of, and both mint their accounts by counting up from
+	// their start. A shared start makes the second fill re-derive accounts the
+	// pre-run already used, so its transactions carry a stale nonce and never
+	// make it into a block ("No receipt found for transaction ..."). Neither
+	// fill creates anywhere near a billion accounts, so the two ranges stay
+	// apart. Pin eoa_start per target when you chain more than two fills onto
+	// one datadir.
+	DefaultPreRunEOAStart uint64 = 1_000_000_000
 )
 
 // PreRunsConfig configures builder.pre_runs — an optional stage that runs
@@ -93,8 +105,13 @@ type PreRunDefaults struct {
 	AddressStubsFile string                       `yaml:"address_stubs_file,omitempty" mapstructure:"address_stubs_file"`
 	AddressStubs     map[string]map[string]string `yaml:"address_stubs,omitempty" mapstructure:"address_stubs"`
 	RPCSeedKey       string                       `yaml:"rpc_seed_key,omitempty" mapstructure:"rpc_seed_key"`
-	DataDirMethod    string                       `yaml:"datadir_method,omitempty" mapstructure:"datadir_method"`
-	FillerExtraArgs  []string                     `yaml:"filler_extra_args,omitempty" mapstructure:"filler_extra_args"`
+	// EOAStart is fill-stateful's --eoa-start (see EESTPayloadTarget.EOAStart):
+	// the first private key of the EOA iterator the fill mints its accounts from.
+	// Unset means DefaultPreRunEOAStart, which keeps the pre-run's accounts clear
+	// of the eest_payloads fill that follows it on the same datadir.
+	EOAStart        *uint64  `yaml:"eoa_start,omitempty" mapstructure:"eoa_start"`
+	DataDirMethod   string   `yaml:"datadir_method,omitempty" mapstructure:"datadir_method"`
+	FillerExtraArgs []string `yaml:"filler_extra_args,omitempty" mapstructure:"filler_extra_args"`
 	// FillEnv are extra environment variables passed to the fill-stateful
 	// container, e.g. BLOATNET_RECEIVER_CONTRACT_COUNT to shrink the setup for a
 	// smoke run. Merged over benchmarkoor's own fill env (which wins on conflict).
@@ -162,6 +179,7 @@ type PreRunTarget struct {
 	AddressStubsFile   string                       `yaml:"address_stubs_file,omitempty" mapstructure:"address_stubs_file"`
 	AddressStubs       map[string]map[string]string `yaml:"address_stubs,omitempty" mapstructure:"address_stubs"`
 	RPCSeedKey         string                       `yaml:"rpc_seed_key,omitempty" mapstructure:"rpc_seed_key"`
+	EOAStart           *uint64                      `yaml:"eoa_start,omitempty" mapstructure:"eoa_start"`
 	DataDirMethod      string                       `yaml:"datadir_method,omitempty" mapstructure:"datadir_method"`
 	FillerExtraArgs    []string                     `yaml:"filler_extra_args,omitempty" mapstructure:"filler_extra_args"`
 	FillEnv            map[string]string            `yaml:"fill_env,omitempty" mapstructure:"fill_env"`
@@ -257,6 +275,10 @@ func (p *PreRunsConfig) ResolveTarget(i int) PreRunTarget {
 
 	if t.RPCSeedKey == "" {
 		t.RPCSeedKey = g.RPCSeedKey
+	}
+
+	if t.EOAStart == nil {
+		t.EOAStart = g.EOAStart
 	}
 
 	if t.DataDirMethod == "" {
@@ -396,6 +418,16 @@ func (t *PreRunTarget) ResolveGasLimit() uint64 {
 	}
 
 	return DefaultPreRunGasLimit
+}
+
+// ResolveEOAStart returns the fill-stateful --eoa-start value for the pre-run
+// fill, defaulting to DefaultPreRunEOAStart.
+func (t *PreRunTarget) ResolveEOAStart() uint64 {
+	if t.EOAStart != nil {
+		return *t.EOAStart
+	}
+
+	return DefaultPreRunEOAStart
 }
 
 // ResolveGasBumpMaxBlocks returns the gas-bump safety cap, defaulting to
@@ -648,6 +680,10 @@ func (c *Config) validatePreRuns() error {
 
 		if t.GasBumpMaxBlocks != nil && *t.GasBumpMaxBlocks < 0 {
 			return fmt.Errorf("%s.gas_bump_max_blocks must be >= 0 when set", prefix)
+		}
+
+		if t.EOAStart != nil && *t.EOAStart == 0 {
+			return fmt.Errorf("%s.eoa_start must be > 0 when set (0 is not a valid key)", prefix)
 		}
 
 		for j := range t.FundingAccounts {
