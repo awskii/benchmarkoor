@@ -8,8 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// erigonPayload is the record Erigon emits, taken verbatim from a validated
-// block on a node built with --debug.slow-block-threshold=0.
+// Taken verbatim from a validated block.
 const erigonPayload = `{"level":"warn","msg":"Slow block","block":{"number":1,"hash":"0x5c6519e89d3b01dc9846d2b67a07202efd45fcd35d380beada32f7be406fd22d","gas_used":12000,"tx_count":1},"timing":{"execution_ms":0.829174,"state_read_ms":0.001553,"state_hash_ms":0.142427,"commit_ms":0.042781,"total_ms":1.015935},"throughput":{"mgas_per_sec":11.81},"state_reads":{"accounts":3,"storage_slots":0,"code":0},"state_writes":{"accounts":1,"storage_slots":0,"code":0},"cache":{"account":{"hits":3,"misses":0,"hit_rate":1},"storage":{"hits":0,"misses":0,"hit_rate":0},"code":{"hits":0,"misses":0,"hit_rate":0}}}`
 
 func TestErigonParser_ParseLine(t *testing.T) {
@@ -22,7 +21,6 @@ func TestErigonParser_ParseLine(t *testing.T) {
 		checkJSON func(t *testing.T, data map[string]any)
 	}{
 		{
-			// Erigon's terminal format leaves a trailing space after the message.
 			name:   "non-TTY line with all fields",
 			line:   `[WARN] [09-01|22:20:12.372] ` + erigonPayload + ` `,
 			wantOK: true,
@@ -63,8 +61,6 @@ func TestErigonParser_ParseLine(t *testing.T) {
 			},
 		},
 		{
-			// On a TTY the level is wrapped in colour codes and the space
-			// between it and the timestamp disappears.
 			name:   "TTY line with ANSI escape codes",
 			line:   "\x1b[33mWARN\x1b[0m[09-01|22:20:12.372] " + erigonPayload + " ",
 			wantOK: true,
@@ -112,8 +108,6 @@ func TestErigonParser_ParseLine(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			// Erigon logs plenty of other JSON at WARN; only the slow block
-			// message carries this schema.
 			name:   "JSON payload from another message",
 			line:   `[WARN] [09-01|22:20:12.372] {"level":"warn","msg":"Something else","block":{"number":1}}`,
 			wantOK: false,

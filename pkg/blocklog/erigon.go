@@ -10,11 +10,8 @@ import (
 // erigonLogPattern matches Erigon slow block log lines (after ANSI stripping).
 // Format: [{LEVEL}] [{timestamp}] {JSON payload}
 // Example: [WARN] [09-01|22:20:12.372] {"level":"warn","msg":"Slow block",...}
-//
-// Erigon abbreviates two of its level names, DBUG and EROR. On a TTY the level
-// is colorised and the brackets and following space are dropped, so the
-// stripped line reads WARN[09-01|...] instead; the separators are matched
-// loosely so a change in level padding cannot silence the parser.
+// On a TTY the brackets are dropped: WARN[09-01|...]. DBUG and EROR are
+// Erigon's own abbreviations; separators are loose so padding cannot silence it.
 var erigonLogPattern = regexp.MustCompile(
 	`^\[?(?:TRACE|DBUG|INFO|WARN|EROR|CRIT)\s*\]?\s*\[[^\]]+\]\s+(\{.+\})\s*$`,
 )
@@ -42,10 +39,7 @@ func (p *erigonParser) ParseLine(line string) (json.RawMessage, bool) {
 
 	jsonStr := matches[1]
 
-	// Erigon has no dedicated slow block logger, so the message is the only
-	// thing separating this payload from any other JSON logged at WARN. The
-	// timing object is required too, so a bare message cannot be stored as a
-	// record that carries none of the metrics.
+	// Erigon has no slow block logger to key on, so the payload is probed.
 	var probe struct {
 		Msg    string           `json:"msg"`
 		Timing *json.RawMessage `json:"timing"`
