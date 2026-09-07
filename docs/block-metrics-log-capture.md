@@ -91,9 +91,10 @@ Without the flag no record is emitted at all. With it, every documented field is
 captured except `state_reads.code_bytes` and `state_writes.code_bytes`, which
 Erigon has no per-block source for and omits rather than reporting as zero.
 
-Both of Erigon's log formats are parsed: the default console line, and
-`--log.json`, which carries the record escaped inside the log entry's own
-`msg` field.
+Every envelope Erigon can produce is parsed: the default console line, the
+colourised form it uses on a TTY, the timestamp-less form under
+`ERIGON_LOG_NO_TIMESTAMPS`, and `--log.json`, which carries the record escaped
+inside the log entry's own `msg` field.
 
 ### Other Clients
 

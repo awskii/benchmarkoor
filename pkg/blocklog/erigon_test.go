@@ -149,9 +149,25 @@ func TestErigonParser_ParseLine(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			name:   "missing timestamp",
+			name:   "ERIGON_LOG_NO_TIMESTAMPS drops the timestamp group",
+			line:   "\x1b[33mWARN\x1b[0m " + erigonPayload + " ",
+			wantOK: true,
+			checkJSON: func(t *testing.T, data map[string]any) {
+				t.Helper()
+
+				assert.Equal(t, "Slow block", data["msg"])
+				assert.Equal(t, 1.165875, data["timing"].(map[string]any)["total_ms"])
+			},
+		},
+		{
+			name:   "no timestamp, brackets kept",
 			line:   `[WARN] ` + erigonPayload,
-			wantOK: false,
+			wantOK: true,
+			checkJSON: func(t *testing.T, data map[string]any) {
+				t.Helper()
+
+				assert.Equal(t, "Slow block", data["msg"])
+			},
 		},
 		{
 			name:   "empty line",
