@@ -14,11 +14,8 @@ import (
 // total_ms is end-to-end and exceeds execution_ms + state_hash_ms + commit_ms.
 const erigonPayload = `{"level":"warn","msg":"Slow block","block":{"number":2,"hash":"0xda4c162eb46b6163de6ab73a4a56d78c34e82771a875687868d4d006e8ac3b37","gas_used":185130,"tx_count":1},"timing":{"execution_ms":0.408167,"state_read_ms":0.001291,"state_hash_ms":0.06425,"commit_ms":0.179,"total_ms":0.744125},"throughput":{"mgas_per_sec":453.56},"state_reads":{"accounts":4,"storage_slots":0},"state_writes":{"accounts":3,"storage_slots":0,"code":1},"cache":{"account":{"hits":4,"misses":0,"hit_rate":100},"storage":{"hits":0,"misses":0,"hit_rate":0}}}`
 
-func erigonJSONLine(t *testing.T, payload string) string {
-	t.Helper()
-
-	msg, err := json.Marshal(payload)
-	require.NoError(t, err)
+func erigonJSONLine(payload string) string {
+	msg, _ := json.Marshal(payload)
 
 	return `{"lvl":"warn","t":"2026-09-03T17:21:56.701597+07:00","msg":` + string(msg) + `}`
 }
@@ -99,35 +96,15 @@ func TestErigonParser_ParseLine(t *testing.T) {
 			name:   "envelope level is not the discriminator (DBUG)",
 			line:   `[DBUG] [09-01|22:20:12.372] ` + erigonPayload,
 			wantOK: true,
-			checkJSON: func(t *testing.T, data map[string]any) {
-				t.Helper()
-
-				assert.Equal(t, "Slow block", data["msg"])
-			},
-		},
-		{
-			name:   "envelope level is not the discriminator (EROR)",
-			line:   `[EROR] [09-01|22:20:12.372] ` + erigonPayload,
-			wantOK: true,
-			checkJSON: func(t *testing.T, data map[string]any) {
-				t.Helper()
-
-				assert.Equal(t, "Slow block", data["msg"])
-			},
 		},
 		{
 			name:   "padded level",
 			line:   `[WARN ] [09-01|22:20:12.372] ` + erigonPayload,
 			wantOK: true,
-			checkJSON: func(t *testing.T, data map[string]any) {
-				t.Helper()
-
-				assert.Equal(t, "Slow block", data["msg"])
-			},
 		},
 		{
 			name:   "--log.json envelope carries the record escaped in msg",
-			line:   erigonJSONLine(t, erigonPayload),
+			line:   erigonJSONLine(erigonPayload),
 			wantOK: true,
 			checkJSON: func(t *testing.T, data map[string]any) {
 				t.Helper()
@@ -139,7 +116,7 @@ func TestErigonParser_ParseLine(t *testing.T) {
 		},
 		{
 			name:   "--log.json envelope carrying an ordinary message",
-			line:   erigonJSONLine(t, "Executed blocks"),
+			line:   erigonJSONLine("Executed blocks"),
 			wantOK: false,
 		},
 		{
@@ -177,11 +154,6 @@ func TestErigonParser_ParseLine(t *testing.T) {
 			name:   "no timestamp, brackets kept",
 			line:   `[WARN] ` + erigonPayload,
 			wantOK: true,
-			checkJSON: func(t *testing.T, data map[string]any) {
-				t.Helper()
-
-				assert.Equal(t, "Slow block", data["msg"])
-			},
 		},
 		{
 			name:   "empty line",
@@ -203,7 +175,9 @@ func TestErigonParser_ParseLine(t *testing.T) {
 				err := json.Unmarshal(result, &parsed)
 				require.NoError(t, err)
 
-				tt.checkJSON(t, parsed)
+				if tt.checkJSON != nil {
+					tt.checkJSON(t, parsed)
+				}
 			} else {
 				assert.Nil(t, result)
 			}

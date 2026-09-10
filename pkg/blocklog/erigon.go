@@ -7,15 +7,12 @@ import (
 	"github.com/ethpandaops/benchmarkoor/pkg/client"
 )
 
-// erigonLogPattern matches Erigon slow block log lines (after ANSI stripping).
-// Format: [{LEVEL}] [{timestamp}] {JSON payload}
-// Example: [WARN] [09-01|22:20:12.372] {"level":"warn","msg":"Slow block",...}
-// On a TTY the brackets are dropped: WARN[09-01|...]. Under
-// ERIGON_LOG_NO_TIMESTAMPS the timestamp group is absent entirely: WARN {...}.
-// DBUG and EROR are Erigon's own abbreviations; separators are loose so padding
-// cannot silence it.
+// erigonLogPattern matches the console form (after ANSI stripping): an
+// optionally bracketed level, an optional bracketed timestamp, then the JSON
+// payload. Requiring a token before the brace is what routes --log.json lines
+// to erigonJSONPayload instead.
 var erigonLogPattern = regexp.MustCompile(
-	`^\[?(?:TRACE|DBUG|INFO|WARN|EROR|CRIT)\s*\]?\s*(?:\[[^\]]+\]\s*)?\s*(\{.+\})\s*$`,
+	`^\[?\w+\s*\]?\s*(?:\[[^\]]+\]\s*)?(\{.+\})\s*$`,
 )
 
 // erigonParser parses JSON payloads from Erigon client slow block logs.
