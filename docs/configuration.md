@@ -1123,7 +1123,34 @@ runner:
 
 The `db_compaction` option compacts the client database before the run measures anything. Compaction needs exclusive access to the database, so the client is never running while it happens: the runner runs the client's own offline command in a one-shot container against the datadir.
 
-Only clients that ship an offline compaction command support this. Today that is **geth** alone (`geth db compact`); every other client fails validation with a clear message.
+Only clients that ship an offline compaction command support this. Today that is **geth** and **erigon**; every other client fails validation with a clear message.
+
+| Client | Compaction | Inspection |
+|--------|------------|------------|
+| geth | `geth db compact` | `geth db inspect` |
+| erigon | `erigon db compact` | `erigon seg du --verbose` |
+
+`erigon db compact` rewrites every mdbx database of the datadir without its free pages. It needs **Erigon 3.7.0-dev or newer** (September 2026); an older binary, including every pinned glamsterdam-devnet image, fails the step with `command db not found`.
+
+> **On erigon, `before_benchmarks` needs `--exec.no-prune` on the instance.** That phase stops and restarts the client, and erigon refuses to reopen a datadir whose receipt domain it pruned past the snapshot files: `[snapshots] gap between snapshot files and DB for domain receipt: files end at txNum 0 but the DB was pruned up to 390625`. A synthetic snapshot has no snapshot files, so the client's own pruning is enough to create the gap. `--exec.no-prune` disables the state-aggregator pruning that advances the marker. Erigon documents the flag for diagnostic and perf-comparison use, which is what a benchmark is, and it removes housekeeping the benchmark does not want anyway. `before_pre_runs` needs no flag: it compacts before the client ever boots, so nothing restarts.
+
+###### Preparation steps (`prepare`)
+
+A client can offer steps that run before the compaction to make it reclaim more. None run unless `prepare` names them, because a step that helps one datadir can ruin another.
+
+| Client | Step | What it does | Needs |
+|--------|------|--------------|-------|
+| erigon | `seg-retire` | `erigon seg retire` — freezes block and history ranges into segment files under `<datadir>/snapshots` and prunes what it froze, which is what leaves free pages for the compaction | A datadir whose history spans whole steps (390,625 blocks) |
+
+```yaml
+db_compaction:
+  enabled: true
+  prepare: [seg-retire]   # erigon, real synced datadir only
+```
+
+On a **real synced erigon datadir** this is the pairing erigon documents, and it is where the compaction reclaims most of its space. A step you name is one you asked for, so its failure fails the phase unless `continue_on_error` is set. Naming a step the client does not offer fails validation, which lists the alternatives and what each one needs.
+
+> **Do not enable `seg-retire` for a state-actor or otherwise synthetic snapshot.** Its history is far shorter than one step, so the retire finds nothing to freeze but prunes anyway, and erigon then refuses to reopen its own datadir with the gap error above. Verified in CI on a snapshot advanced to block 39: `retiring blocks from=0 to=39`, `Build state history snapshots` (nothing to build), `Prune state history` (marker advances regardless). The compaction alone is worth running there — it took that datadir's `chaindata` from 2.0GB to 32MB.
 
 Besu was checked and cannot be supported yet: as of Besu 26.6.1, `besu storage` has no compaction subcommand. `trie-log prune` deletes trie logs below the retention limit instead of rewriting the database, which is a different operation and removes history the Bonsai rollback needs.
 
@@ -1134,7 +1161,7 @@ runner:
       db_compaction:
         enabled: true
         when: [before_benchmarks]   # or [before_pre_runs], or both
-        inspect: true               # `geth db inspect` before and after
+        inspect: true               # the client inspection before and after
         timeout: 3h
         extra_args: ["--cache=16384"]
 ```
@@ -1144,7 +1171,8 @@ runner:
 | `enabled` | bool | Yes | `false` | Enable the compaction |
 | `when` | []string | No | `[before_benchmarks]` | The lifecycle points at which to compact (see below). A plain string also works |
 | `inspect` | bool | No | `true` | Run the client database inspection before and after each compaction. A failed inspection is logged and never fails the run |
-| `timeout` | string | No | `3h` | Cap for one phase's work — the compaction and both inspections (Go duration). Applies per phase |
+| `prepare` | []string | No | - | Client preparation steps to run before each compaction, in order (see [Preparation steps](#preparation-steps-prepare)) |
+| `timeout` | string | No | `3h` | Cap for one phase's work — every preparation step, the compaction, and both inspections (Go duration). Applies per phase |
 | `image` | string | No | the instance image | Image of the compaction container. The default keeps the tool version and the client version identical |
 | `extra_args` | []string | No | - | Extra arguments for the compaction command, e.g. `--cache=16384` |
 | `continue_on_error` | bool | No | `false` | Downgrade a compaction failure to a warning. A failed compaction makes the results incomparable, so the run fails by default |
@@ -1204,6 +1232,7 @@ Two rules follow from the mechanisms:
 
 - **ZFS persists only at `before_pre_runs`.** The clone is a child of its source dataset, so no promote or rename puts the compacted clone back at the source path. Compacting the source first also keeps the clone small, since a compaction inside a copy-on-write clone rewrites the whole database into it.
 - **A schelk persist at `before_benchmarks` needs `promote_post_pre_runs: true`.** Persisting there moves the baseline head past the pre-run bundle, which is exactly what that option does. Requiring it keeps the decision explicit, and lets the runner persist both with a single promote.
+- **A baseline that already carries the pre-run state is still compacted.** The promote has nothing of its own left to do there, so the runner does the stop, the compaction and the promote for the compaction alone. It happens once: the marker the compaction writes goes into the promoted baseline, and every later run skips both.
 
 > **A persist is destructive and irreversible.** It overwrites the golden image. On ZFS, `safety_snapshot` leaves a `<dataset>@benchmarkoor-precompaction-<run-id>` snapshot that a `zfs rollback` restores exactly.
 
@@ -1216,9 +1245,11 @@ A finished compaction writes `.benchmarkoor-db-compaction.json` at the root of t
   "version": 1,
   "phases": {
     "before_pre_runs": {
-      "client": "geth",
-      "image": "ethereum/client-go:stable",
+      "client": "erigon",
+      "image": "ethpandaops/erigon:main",
       "run_id": "20260827-101203-abcd",
+      "prepare": ["seg-retire"],
+      "extra_args": ["--cache=16384"],
       "completed_at": "2026-08-27T10:12:03Z",
       "duration_ms": 812345,
       "datadir_bytes": { "before": 812000000000, "after": 640000000000 }
@@ -1227,9 +1258,33 @@ A finished compaction writes `.benchmarkoor-db-compaction.json` at the root of t
 }
 ```
 
+`prepare` and `extra_args` record the settings that decided what the compaction did to the database, alongside the `image` that ran it — the compaction container's image, which is `db_compaction.image` when set and the instance image otherwise. An absent list means the setting was empty — a marker written before these fields existed cannot have had a value either, so the two cases coincide.
+
+The rest of `db_compaction` is deliberately not recorded. `timeout`, `inspect`, `continue_on_error`, `when`, `persist` and `skip_if_marked` govern the run rather than the bytes the compaction leaves behind, so recording them would only produce mismatches that mean nothing.
+
 It holds only what is known the moment the compaction finishes, so it is written once and never patched. With `persist` enabled, `skip_if_marked` defaults to true and a later run skips a phase the marker already names — which is what stops every run paying the compaction cost again.
 
-The marker cannot tell that a datadir advanced after it was written. If you point a longer pre-run bundle at a baseline persisted at `before_benchmarks`, set `skip_if_marked: false` to force the compaction.
+A skipped phase logs how the datadir was compacted, so a run that compacts nothing itself can still say how its baseline got that way:
+
+```
+Datadir already carries a compaction marker for this phase; skipping
+  compacted_at=2026-08-27T10:12:03Z run_id=20260827-101203-abcd
+  image=ethpandaops/erigon:main prepare=seg-retire extra_args=--cache=16384
+```
+
+**`skip_if_marked` skips by phase, not by config.** Changing `prepare` or `extra_args` on a persisted datadir does not recompact it, so the new settings never take effect. That case logs a WARNING naming what differs, rather than passing silently:
+
+```
+Datadir already carries a compaction marker for this phase, so it is skipped and this
+run's db_compaction settings do NOT take effect; the datadir keeps the compaction the
+marker describes (set db_compaction.skip_if_marked: false to recompact)
+  prepare=seg-retire extra_args=--cache=16384
+  changed=prepare: seg-retire -> none; extra_args: --cache=16384 -> --cache=32768
+```
+
+The `image` is reported but not compared. Client images change routinely, and the marker cannot tell whether a new one compacts differently, so warning on every bump would teach you to ignore the warning — the recorded image is in the line either way, so a datadir compacted by an older build stays visible.
+
+The marker also cannot tell that a datadir advanced after it was written. If you point a longer pre-run bundle at a baseline persisted at `before_benchmarks`, set `skip_if_marked: false` to force the compaction.
 
 ###### Rollback strategy
 
@@ -1249,13 +1304,14 @@ Each phase writes its reports to the run results directory:
 ```
 <run-results>/db-compaction/
   before_pre_runs/inspect-before.txt
+  before_pre_runs/seg-retire.log        # one per selected preparation step
   before_pre_runs/compact.log
   before_pre_runs/inspect-after.txt
   before_pre_runs/compaction.json
   before_benchmarks/...
 ```
 
-`compaction.json` records the command, the duration, the datadir size either side, and — at `before_benchmarks` only, where the runner reads it from the client it is about to stop — the datadir head.
+`compaction.json` records the command, the duration, the datadir size either side, and — at `before_benchmarks` only, where the runner reads it from the client it is about to stop — the datadir head. Each selected preparation step gets its own log, named after the step, and a `prepare[]` entry.
 
 The inspection is a report, so a failure is logged and the compaction still runs. geth 1.17.5 exits 1 on `db inspect` against a datadir whose freezer is empty, which a freshly-initialised datadir has.
 
@@ -1427,7 +1483,7 @@ runner:
 | `run_timeout` | string | No | From `runner.client.config` | Instance-specific run timeout duration |
 | `retry_new_payloads_syncing_state` | object | No | From `runner.client.config` | Instance-specific retry config for SYNCING responses |
 | `retry_new_payloads_failed_state` | object | No | From `runner.client.config` | Instance-specific retry config for non-SYNCING failures |
-| `resource_limits` | object | No | From `runner.client.config` | Instance-specific resource limits |
+| `resource_limits` | object | No | From `runner.client.config` | Instance-specific resource limits (merged field by field with the global limits) |
 | `post_test_rpc_calls` | []object | No | From `runner.client.config` | Instance-specific post-test RPC calls (replaces global) |
 | `post_test_sleep_duration` | string | No | From `runner.client.config` | Instance-specific post-test sleep duration |
 | `bootstrap_fcu` | bool/object | No | From `runner.client.config` | Instance-specific bootstrap FCU setting |
@@ -1475,7 +1531,33 @@ Applying an override to the wrong genesis format is an error (a geth-format over
 
 ## Resource Limits
 
-Resource limits can be configured globally (`runner.client.config.resource_limits`) or per-instance (`runner.instances[].resource_limits`). Instance-level settings override global defaults.
+Resource limits can be configured globally (`runner.client.config.resource_limits`) or per-instance (`runner.instances[].resource_limits`). The two levels merge field by field: an instance keeps every global value that it does not set.
+
+```yaml
+runner:
+  client:
+    config:
+      resource_limits:
+        cpuset: [6, 7, 8, 9, 10, 11]
+        cpu_freq: "3600MHz"
+        cpu_turboboost: false
+        cpu_freq_governor: performance
+        memory: "32g"
+        swap_disabled: true
+  instances:
+    - id: geth-1
+      client: geth
+      resource_limits:
+        memory: "16g" # Only the memory limit changes. The CPU and swap
+                      # settings stay at the global values.
+```
+
+Merge rules:
+
+- A field that the instance omits keeps the global value.
+- `cpuset` and `cpuset_count` are one setting. An instance that sets either one replaces both global fields.
+- Each `blkio_config` device list is replaced as a whole. An instance `device_read_bps` list does not change the global `device_write_bps` list.
+- Set `swap_disabled: false` on the instance to turn swap on again when the global config disables it.
 
 ```yaml
 resource_limits:

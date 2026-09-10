@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/ethpandaops/benchmarkoor/pkg/client"
@@ -24,8 +26,8 @@ import (
 const dbCompactionMarkerVersion = 1
 
 // dbCompactionRequest describes one compaction phase against a datadir whose
-// client is NOT running. The caller owns the client lifecycle: `geth db
-// compact` takes the database lock, so a live node makes it fail.
+// client is NOT running. The caller owns the client lifecycle: the client's
+// compaction command takes the database lock, so a live node makes it fail.
 type dbCompactionRequest struct {
 	Instance  *config.ClientInstance
 	Spec      client.Spec
@@ -74,6 +76,13 @@ type dbCompactionSizes struct {
 	After  int64 `json:"after"`
 }
 
+// dbCompactionStep is one preparation command of a compaction phase, as the run
+// report records it.
+type dbCompactionStep struct {
+	Name    string   `json:"name"`
+	Command []string `json:"command"`
+}
+
 // dbCompactionReport is the per-run record of one compaction phase, written to
 // <results>/db-compaction/<phase>/compaction.json.
 type dbCompactionReport struct {
@@ -85,6 +94,7 @@ type dbCompactionReport struct {
 	CompletedAt  string             `json:"completed_at,omitempty"`
 	DurationMS   int64              `json:"duration_ms"`
 	Persisted    bool               `json:"persisted"`
+	Prepare      []dbCompactionStep `json:"prepare,omitempty"`
 	Command      []string           `json:"command"`
 	DatadirBytes *dbCompactionSizes `json:"datadir_bytes,omitempty"`
 	Head         *dbCompactionHead  `json:"head,omitempty"`
@@ -106,12 +116,56 @@ type dbCompactionMarker struct {
 
 // dbCompactionMarkerEntry is one phase's entry in the marker file.
 type dbCompactionMarkerEntry struct {
-	Client       string             `json:"client"`
-	Image        string             `json:"image"`
-	RunID        string             `json:"run_id"`
+	Client string `json:"client"`
+	Image  string `json:"image"`
+	RunID  string `json:"run_id"`
+
+	// Prepare names the db_compaction.prepare steps that ran, and ExtraArgs the
+	// arguments the compaction command carried. They are what a later run
+	// compares against its own config, so a phase it skips can say HOW the
+	// datadir was compacted and whether that is what this run asks for. Image is
+	// recorded and reported beside them, but not compared: see
+	// dbCompactionMarkerDiff.
+	//
+	// The rest of db_compaction is deliberately absent. timeout, inspect,
+	// continue_on_error, when, persist and skip_if_marked govern the run, not
+	// the bytes the compaction leaves behind, so recording them would only
+	// produce mismatches that mean nothing.
+	//
+	// An absent list means the setting was empty. A marker written before these
+	// fields existed cannot have had a value either, so the two cases coincide
+	// and no schema version bump is needed.
+	Prepare   []string `json:"prepare,omitempty"`
+	ExtraArgs []string `json:"extra_args,omitempty"`
+
 	CompletedAt  string             `json:"completed_at"`
 	DurationMS   int64              `json:"duration_ms"`
 	DatadirBytes *dbCompactionSizes `json:"datadir_bytes,omitempty"`
+}
+
+// dbCompactionListSummary renders a setting's value for a log line, so an empty
+// one reads as a deliberate "none" rather than a blank field.
+func dbCompactionListSummary(values []string) string {
+	if len(values) == 0 {
+		return "none"
+	}
+
+	return strings.Join(values, ",")
+}
+
+// image returns the image the maintenance containers actually run: the
+// compaction's own image when db_compaction.image is set, and the instance
+// image otherwise.
+//
+// The run report and the datadir marker record this rather than the instance
+// image, so "which build compacted this datadir" stays answerable when the two
+// differ — which is the whole reason db_compaction.image exists.
+func (req *dbCompactionRequest) image() string {
+	if req.Cfg != nil && req.Cfg.Image != "" {
+		return req.Cfg.Image
+	}
+
+	return req.ImageName
 }
 
 // hostPath returns the host path of the datadir mount, or "" when
@@ -150,10 +204,15 @@ func (r *runner) runDBCompaction(
 		)
 	}
 
+	steps, err := dbCompactionSelectedSteps(cmds, req.Cfg)
+	if err != nil {
+		return false, err
+	}
+
 	hostPath := req.hostPath()
 
 	if entry := r.dbCompactionSkipEntry(req.Instance, req.Phase, req.Mount); entry != nil {
-		logDBCompactionSkip(log, entry)
+		logDBCompactionSkip(log, entry, req.Cfg)
 
 		return false, nil
 	}
@@ -168,11 +227,12 @@ func (r *runner) runDBCompaction(
 	report := &dbCompactionReport{
 		Phase:     req.Phase,
 		Client:    req.Instance.Client,
-		Image:     req.ImageName,
+		Image:     req.image(),
 		RunID:     req.RunID,
 		StartedAt: started.UTC().Format(time.RFC3339),
 		Persisted: req.Persisting,
-		Command:   append(append([]string{}, cmds.Compact...), req.Cfg.ExtraArgs...),
+		Prepare:   dbCompactionPrepareReport(steps),
+		Command:   dbCompactionCommand(cmds, req.Cfg),
 		Head:      req.Head,
 	}
 
@@ -180,7 +240,7 @@ func (r *runner) runDBCompaction(
 		report.DatadirBytes = &dbCompactionSizes{Before: dirSize(hostPath)}
 	}
 
-	runErr := r.runDBCompactionContainers(ctx, req, cmds, phaseDir, log)
+	runErr := r.runDBCompactionContainers(ctx, req, cmds, steps, phaseDir, log)
 
 	if hostPath != "" {
 		report.DatadirBytes.After = dirSize(hostPath)
@@ -225,8 +285,85 @@ func (r *runner) runDBCompaction(
 	return true, nil
 }
 
-// runDBCompactionContainers runs the inspection either side of the compaction
-// and the compaction itself, each in its own one-shot container.
+// dbCompactionSelectedSteps resolves db_compaction.prepare against the steps
+// the client offers, in the order the config names them.
+//
+// Validation already rejects an unknown name, so reaching one here means the
+// config was never validated. Refusing beats silently skipping the step the
+// user asked for.
+func dbCompactionSelectedSteps(
+	cmds *client.DBMaintenanceCommands, cfg *config.DBCompactionConfig,
+) ([]client.DBMaintenanceStep, error) {
+	if len(cfg.Prepare) == 0 {
+		return nil, nil
+	}
+
+	byName := make(map[string]client.DBMaintenanceStep, len(cmds.Prepare))
+	for _, step := range cmds.Prepare {
+		byName[step.Name] = step
+	}
+
+	steps := make([]client.DBMaintenanceStep, 0, len(cfg.Prepare))
+
+	for _, name := range cfg.Prepare {
+		step, ok := byName[name]
+		if !ok {
+			return nil, fmt.Errorf("unknown db_compaction.prepare step %q", name)
+		}
+
+		steps = append(steps, step)
+	}
+
+	return steps, nil
+}
+
+// dbCompactionStepNames returns the step names of a report's prepare list, in
+// order, for the datadir marker.
+func dbCompactionStepNames(steps []dbCompactionStep) []string {
+	if len(steps) == 0 {
+		return nil
+	}
+
+	names := make([]string, 0, len(steps))
+	for _, step := range steps {
+		names = append(names, step.Name)
+	}
+
+	return names
+}
+
+// dbCompactionPrepareReport records the steps that run, for the run report.
+func dbCompactionPrepareReport(steps []client.DBMaintenanceStep) []dbCompactionStep {
+	if len(steps) == 0 {
+		return nil
+	}
+
+	out := make([]dbCompactionStep, 0, len(steps))
+	for _, step := range steps {
+		out = append(out, dbCompactionStep{
+			Name:    step.Name,
+			Command: append([]string{}, step.Args...),
+		})
+	}
+
+	return out
+}
+
+// dbCompactionCommand returns the compaction argv with the configured extra
+// arguments appended, without mutating the client's own slice.
+func dbCompactionCommand(
+	cmds *client.DBMaintenanceCommands, cfg *config.DBCompactionConfig,
+) []string {
+	return append(append([]string{}, cmds.Compact...), cfg.ExtraArgs...)
+}
+
+// runDBCompactionContainers runs the inspection either side of the compaction,
+// the selected preparation steps, and the compaction itself, each in its own
+// one-shot container.
+//
+// A preparation step is one the user asked for by name, so its failure fails the
+// phase: the compaction that follows would not be the operation they configured.
+// continue_on_error still downgrades it.
 //
 // An inspection failure is never fatal: it is a report, and losing it must not
 // cost the run its compaction. geth 1.17.5 exits 1 on `db inspect` against a
@@ -236,6 +373,7 @@ func (r *runner) runDBCompactionContainers(
 	ctx context.Context,
 	req *dbCompactionRequest,
 	cmds *client.DBMaintenanceCommands,
+	steps []client.DBMaintenanceStep,
 	phaseDir string,
 	log logrus.FieldLogger,
 ) error {
@@ -253,12 +391,30 @@ func (r *runner) runDBCompactionContainers(
 		}
 	}
 
-	log.WithField("timeout", req.Cfg.EffectiveTimeout()).Info("Compacting the database")
+	// The timeout covers the whole sequence, so every step logs it: a step the
+	// timeout kills names the budget it ran out of.
+	timeout := req.Cfg.EffectiveTimeout()
 
-	compactCmd := append(append([]string{}, cmds.Compact...), req.Cfg.ExtraArgs...)
+	for i, step := range steps {
+		log.WithFields(logrus.Fields{
+			"step":    step.Name,
+			"index":   fmt.Sprintf("%d/%d", i+1, len(steps)),
+			"timeout": timeout,
+		}).Info("Preparing the database for compaction")
+
+		if err := r.runDBMaintenanceContainer(
+			ctx, req, step.Name, step.Args,
+			filepath.Join(phaseDir, step.Name+".log"),
+		); err != nil {
+			return fmt.Errorf("preparation step %q: %w", step.Name, err)
+		}
+	}
+
+	log.WithField("timeout", timeout).Info("Compacting the database")
 
 	if err := r.runDBMaintenanceContainer(
-		ctx, req, "compact", compactCmd, filepath.Join(phaseDir, "compact.log"),
+		ctx, req, "compact", dbCompactionCommand(cmds, req.Cfg),
+		filepath.Join(phaseDir, "compact.log"),
 	); err != nil {
 		return err
 	}
@@ -293,14 +449,9 @@ func (r *runner) runDBMaintenanceContainer(
 		"benchmarkoor-%s-%s-dbc-%s-%s", req.RunID, req.Instance.ID, req.Phase, step,
 	)
 
-	image := req.ImageName
-	if req.Cfg.Image != "" {
-		image = req.Cfg.Image
-	}
-
 	spec := &docker.ContainerSpec{
 		Name:        name,
-		Image:       image,
+		Image:       req.image(),
 		Entrypoint:  req.Instance.Entrypoint,
 		Command:     command,
 		Mounts:      []docker.Mount{req.Mount},
@@ -325,7 +476,7 @@ func (r *runner) runDBMaintenanceContainer(
 	}()
 
 	_, _ = fmt.Fprintf(
-		out, "# %s %s\n# %v\n\n", image, step, command,
+		out, "# %s %s\n# %v\n\n", req.image(), step, command,
 	)
 
 	var stdout, stderr io.Writer = out, out
@@ -394,6 +545,8 @@ func (r *runner) writeDBCompactionMarker(
 		Client:       req.Instance.Client,
 		Image:        report.Image,
 		RunID:        req.RunID,
+		Prepare:      dbCompactionStepNames(report.Prepare),
+		ExtraArgs:    append([]string{}, dbCompactionConfiguredExtraArgs(req.Cfg)...),
 		CompletedAt:  report.CompletedAt,
 		DurationMS:   report.DurationMS,
 		DatadirBytes: report.DatadirBytes,
@@ -505,15 +658,89 @@ func (r *runner) dbCompactionSkipEntry(
 	return &entry
 }
 
-// logDBCompactionSkip reports a phase the datadir marker already covers.
-func logDBCompactionSkip(log logrus.FieldLogger, entry *dbCompactionMarkerEntry) {
-	log.WithFields(logrus.Fields{
+// logDBCompactionSkip reports a phase the datadir marker already covers, and
+// says how that earlier compaction ran.
+//
+// The marker is the only record of what the persisted baseline had done to it,
+// so the skip line carries the earlier run's id, image and settings: a run that
+// compacts nothing itself should still be able to say how its datadir got that
+// way.
+//
+// When this run's settings would do something else, the line is a WARNING
+// naming what differs. `skip_if_marked` skips by PHASE, not by config, so a
+// changed setting is silently without effect on a persisted baseline unless the
+// skip says so.
+func logDBCompactionSkip(
+	log logrus.FieldLogger, entry *dbCompactionMarkerEntry, cfg *config.DBCompactionConfig,
+) {
+	fields := logrus.Fields{
 		"compacted_at": entry.CompletedAt,
 		"run_id":       entry.RunID,
-	}).Info(
+		"image":        entry.Image,
+		"prepare":      dbCompactionListSummary(entry.Prepare),
+		"extra_args":   dbCompactionListSummary(entry.ExtraArgs),
+	}
+
+	if diff := dbCompactionMarkerDiff(entry, cfg); len(diff) > 0 {
+		fields["changed"] = strings.Join(diff, "; ")
+
+		log.WithFields(fields).Warn(
+			"Datadir already carries a compaction marker for this phase, so it is" +
+				" skipped and this run's db_compaction settings do NOT take effect;" +
+				" the datadir keeps the compaction the marker describes" +
+				" (set db_compaction.skip_if_marked: false to recompact)",
+		)
+
+		return
+	}
+
+	log.WithFields(fields).Info(
 		"Datadir already carries a compaction marker for this phase; skipping" +
 			" (set db_compaction.skip_if_marked: false to force)",
 	)
+}
+
+// dbCompactionMarkerDiff lists the recorded settings that differ from the ones
+// this run is configured with, each as "name: recorded -> configured".
+//
+// Only the settings that decide what the compaction does to the database are
+// compared. timeout, inspect, continue_on_error, when, persist and
+// skip_if_marked govern the run rather than the bytes, so a change there is not
+// a reason to tell anyone their datadir is stale.
+//
+// The image is reported but NOT compared. Client images change routinely here,
+// and the marker cannot tell whether a new one compacts differently, so warning
+// on every bump would teach people to ignore the warning.
+func dbCompactionMarkerDiff(
+	entry *dbCompactionMarkerEntry, cfg *config.DBCompactionConfig,
+) []string {
+	var diff []string
+
+	if want := cfg.PrepareSteps(); !slices.Equal(want, entry.Prepare) {
+		diff = append(diff, fmt.Sprintf(
+			"prepare: %s -> %s",
+			dbCompactionListSummary(entry.Prepare), dbCompactionListSummary(want),
+		))
+	}
+
+	if want := dbCompactionConfiguredExtraArgs(cfg); !slices.Equal(want, entry.ExtraArgs) {
+		diff = append(diff, fmt.Sprintf(
+			"extra_args: %s -> %s",
+			dbCompactionListSummary(entry.ExtraArgs), dbCompactionListSummary(want),
+		))
+	}
+
+	return diff
+}
+
+// dbCompactionConfiguredExtraArgs returns the configured compaction arguments,
+// tolerating a nil config the way the config's own accessors do.
+func dbCompactionConfiguredExtraArgs(cfg *config.DBCompactionConfig) []string {
+	if cfg == nil {
+		return nil
+	}
+
+	return cfg.ExtraArgs
 }
 
 // dbCompactionPersistsAt reports whether the instance writes the result of the

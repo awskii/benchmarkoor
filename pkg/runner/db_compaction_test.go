@@ -1,9 +1,13 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ethpandaops/benchmarkoor/pkg/client"
@@ -22,6 +26,7 @@ func TestDBCompactionMarker_RoundTrip(t *testing.T) {
 
 	req := &dbCompactionRequest{
 		Instance: &config.ClientInstance{ID: "geth", Client: "geth"},
+		Cfg:      &config.DBCompactionConfig{ExtraArgs: []string{"--cache=16384"}},
 		Phase:    config.DBCompactionBeforePreRuns,
 		RunID:    "run-1",
 	}
@@ -30,6 +35,7 @@ func TestDBCompactionMarker_RoundTrip(t *testing.T) {
 		CompletedAt:  "2026-08-27T10:12:03Z",
 		DurationMS:   4200,
 		DatadirBytes: &dbCompactionSizes{Before: 200, After: 100},
+		Prepare:      []dbCompactionStep{{Name: "seg-retire"}},
 	}
 
 	r.writeDBCompactionMarker(dir, req, report, log)
@@ -46,6 +52,11 @@ func TestDBCompactionMarker_RoundTrip(t *testing.T) {
 	assert.Equal(t, int64(4200), entry.DurationMS)
 	require.NotNil(t, entry.DatadirBytes)
 	assert.Equal(t, int64(100), entry.DatadirBytes.After)
+
+	// The settings that decided what the compaction did are recorded, so a later
+	// run that skips this phase can say how the datadir was compacted.
+	assert.Equal(t, []string{"seg-retire"}, entry.Prepare)
+	assert.Equal(t, []string{"--cache=16384"}, entry.ExtraArgs)
 
 	// A second phase is added, never replacing the first.
 	req.Phase = config.DBCompactionBeforeBenchmarks
@@ -145,17 +156,63 @@ func TestGethDBMaintenanceCommands(t *testing.T) {
 
 	cmds := spec.DBMaintenanceCommands("/var/lib/geth")
 	require.NotNil(t, cmds)
+	assert.Empty(t, cmds.Prepare, "geth compacts in one command")
 	assert.Equal(t, []string{"db", "compact", "--datadir=/var/lib/geth"}, cmds.Compact)
 	assert.Equal(t, []string{"db", "inspect", "--datadir=/var/lib/geth"}, cmds.Inspect)
 
 	assert.True(t, client.SupportsDBCompaction(client.ClientGeth))
+}
 
+// TestErigonDBMaintenanceCommands pins the exact argv verified against
+// erigon 3.7.0-dev, and that the retire is offered but not part of the
+// compaction unless the config selects it.
+func TestErigonDBMaintenanceCommands(t *testing.T) {
+	spec, err := client.NewRegistry().Get(client.ClientErigon)
+	require.NoError(t, err)
+
+	cmds := spec.DBMaintenanceCommands("/var/lib/erigon")
+	require.NotNil(t, cmds)
+
+	assert.Equal(t, []string{"db", "compact", "--datadir=/var/lib/erigon"}, cmds.Compact)
+	assert.Equal(
+		t, []string{"seg", "du", "--datadir=/var/lib/erigon", "--verbose"}, cmds.Inspect,
+	)
+
+	// `seg retire` is offered, never run unless db_compaction.prepare says so.
+	require.Len(t, cmds.Prepare, 1)
+	assert.Equal(t, "seg-retire", cmds.Prepare[0].Name)
+	assert.Equal(
+		t, []string{"seg", "retire", "--datadir=/var/lib/erigon"}, cmds.Prepare[0].Args,
+	)
+	assert.NotEmpty(t, cmds.Prepare[0].Why, "validation prints this to the user")
+
+	assert.True(t, client.SupportsDBCompaction(client.ClientErigon))
+}
+
+func TestSupportsDBCompaction_UnsupportedClients(t *testing.T) {
 	for _, other := range []client.ClientType{
-		client.ClientBesu, client.ClientNethermind, client.ClientErigon,
+		client.ClientBesu, client.ClientNethermind,
 		client.ClientReth, client.ClientNimbus, client.ClientEthrex,
 	} {
 		assert.False(t, client.SupportsDBCompaction(other), string(other))
 	}
+}
+
+// TestDBCompactionCommand checks that extra_args land on the compaction and
+// that the client's own slice is not mutated.
+func TestDBCompactionCommand(t *testing.T) {
+	cmds := &client.DBMaintenanceCommands{
+		Compact: []string{"db", "compact", "--datadir=/data"},
+	}
+
+	got := dbCompactionCommand(cmds, &config.DBCompactionConfig{
+		ExtraArgs: []string{"--cache=16384"},
+	})
+
+	assert.Equal(
+		t, []string{"db", "compact", "--datadir=/data", "--cache=16384"}, got,
+	)
+	assert.Equal(t, []string{"db", "compact", "--datadir=/data"}, cmds.Compact)
 }
 
 func TestDirSize(t *testing.T) {
@@ -290,4 +347,369 @@ func TestDBCompactionSkipEntry(t *testing.T) {
 			t, r.dbCompactionSkipEntry(instance, config.DBCompactionBeforePreRuns, mount),
 		)
 	})
+}
+
+// fakeDBMaintenanceMgr is a docker.ContainerManager that only implements the
+// one call the compaction makes. The embedded interface is nil on purpose: a
+// call to anything else panics, which is what makes the test tell us if the
+// compaction path grows a dependency it should not have.
+type fakeDBMaintenanceMgr struct {
+	docker.ContainerManager
+
+	// failCommand fails any container whose command starts with this word.
+	failCommand string
+
+	ran []string
+}
+
+func (f *fakeDBMaintenanceMgr) RunInitContainer(
+	_ context.Context, spec *docker.ContainerSpec, stdout, _ io.Writer,
+) error {
+	f.ran = append(f.ran, strings.Join(spec.Command, " "))
+
+	_, _ = fmt.Fprintln(stdout, "fake container output")
+
+	if f.failCommand != "" && len(spec.Command) > 0 && spec.Command[0] == f.failCommand {
+		return fmt.Errorf("exit status 1")
+	}
+
+	return nil
+}
+
+// dbCompactionTestRunner wires a runner with a fake container manager and a
+// temporary results dir, for the phases that only need the command sequence.
+func dbCompactionTestRunner(
+	t *testing.T, mgr docker.ContainerManager,
+) (*runner, string) {
+	t.Helper()
+
+	resultsDir := t.TempDir()
+
+	return &runner{
+		log:          logrus.New(),
+		cfg:          &Config{ResultsDir: resultsDir},
+		containerMgr: mgr,
+	}, resultsDir
+}
+
+func dbCompactionTestRequest(resultsDir string) *dbCompactionRequest {
+	return &dbCompactionRequest{
+		Instance:   &config.ClientInstance{ID: "erigon", Client: "erigon"},
+		Cfg:        &config.DBCompactionConfig{Enabled: true, Timeout: "1m"},
+		Phase:      config.DBCompactionBeforeBenchmarks,
+		ImageName:  "erigontech/erigon:main-latest",
+		RunID:      "run-1",
+		Mount:      docker.Mount{Type: "bind", Source: resultsDir, Target: "/data"},
+		ResultsDir: resultsDir,
+	}
+}
+
+// TestRunDBCompactionContainers_Sequence pins the order of a whole phase, that
+// extra_args reach only the compaction, and that each step writes its own log.
+func TestRunDBCompactionContainers_Sequence(t *testing.T) {
+	mgr := &fakeDBMaintenanceMgr{}
+	r, resultsDir := dbCompactionTestRunner(t, mgr)
+
+	cmds := &client.DBMaintenanceCommands{
+		Compact: []string{"db", "compact"},
+		Inspect: []string{"seg", "du"},
+	}
+
+	req := dbCompactionTestRequest(resultsDir)
+	req.Cfg.ExtraArgs = []string{"--cache=16384"}
+
+	require.NoError(t, r.runDBCompactionContainers(
+		context.Background(), req, cmds, nil, resultsDir, r.log,
+	))
+
+	assert.Equal(t, []string{
+		"seg du", "db compact --cache=16384", "seg du",
+	}, mgr.ran)
+
+	for _, name := range []string{
+		"inspect-before.txt", "compact.log", "inspect-after.txt",
+	} {
+		assert.FileExists(t, filepath.Join(resultsDir, name))
+	}
+}
+
+// TestRunDBCompactionContainers_CompactionFails checks that a failed compaction
+// fails the phase, while a failed inspection does not.
+func TestRunDBCompactionContainers_CompactionFails(t *testing.T) {
+	t.Run("compaction failure fails the phase", func(t *testing.T) {
+		mgr := &fakeDBMaintenanceMgr{failCommand: "db"}
+		r, resultsDir := dbCompactionTestRunner(t, mgr)
+
+		err := r.runDBCompactionContainers(
+			context.Background(), dbCompactionTestRequest(resultsDir),
+			&client.DBMaintenanceCommands{Compact: []string{"db", "compact"}},
+			nil, resultsDir, r.log,
+		)
+		require.Error(t, err)
+	})
+
+	t.Run("inspection failure does not", func(t *testing.T) {
+		mgr := &fakeDBMaintenanceMgr{failCommand: "seg"}
+		r, resultsDir := dbCompactionTestRunner(t, mgr)
+
+		err := r.runDBCompactionContainers(
+			context.Background(), dbCompactionTestRequest(resultsDir),
+			&client.DBMaintenanceCommands{
+				Compact: []string{"db", "compact"},
+				Inspect: []string{"seg", "du"},
+			},
+			nil, resultsDir, r.log,
+		)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"seg du", "db compact", "seg du"}, mgr.ran)
+	})
+}
+
+// TestDBCompactionSelectedSteps covers the opt-in: nothing runs unless
+// db_compaction.prepare names it, and the config's order wins.
+func TestDBCompactionSelectedSteps(t *testing.T) {
+	cmds := &client.DBMaintenanceCommands{
+		Prepare: []client.DBMaintenanceStep{
+			{Name: "seg-retire", Args: []string{"seg", "retire"}},
+			{Name: "other", Args: []string{"other"}},
+		},
+		Compact: []string{"db", "compact"},
+	}
+
+	t.Run("no prepare selects nothing", func(t *testing.T) {
+		steps, err := dbCompactionSelectedSteps(cmds, &config.DBCompactionConfig{})
+		require.NoError(t, err)
+		assert.Empty(t, steps)
+	})
+
+	t.Run("selects in the configured order", func(t *testing.T) {
+		steps, err := dbCompactionSelectedSteps(cmds, &config.DBCompactionConfig{
+			Prepare: []string{"other", "seg-retire"},
+		})
+		require.NoError(t, err)
+		require.Len(t, steps, 2)
+		assert.Equal(t, "other", steps[0].Name)
+		assert.Equal(t, "seg-retire", steps[1].Name)
+	})
+
+	t.Run("an unknown name is refused", func(t *testing.T) {
+		_, err := dbCompactionSelectedSteps(cmds, &config.DBCompactionConfig{
+			Prepare: []string{"nope"},
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "nope")
+	})
+}
+
+// TestRunDBCompactionContainers_PrepareStep runs a selected step and checks the
+// order, its own log, and that its failure fails the phase — the user asked for
+// it by name, so the compaction alone is not what they configured.
+func TestRunDBCompactionContainers_PrepareStep(t *testing.T) {
+	cmds := &client.DBMaintenanceCommands{
+		Prepare: []client.DBMaintenanceStep{
+			{Name: "seg-retire", Args: []string{"seg", "retire"}},
+		},
+		Compact: []string{"db", "compact"},
+	}
+	steps := cmds.Prepare
+
+	t.Run("runs before the compaction", func(t *testing.T) {
+		mgr := &fakeDBMaintenanceMgr{}
+		r, resultsDir := dbCompactionTestRunner(t, mgr)
+
+		require.NoError(t, r.runDBCompactionContainers(
+			context.Background(), dbCompactionTestRequest(resultsDir),
+			cmds, steps, resultsDir, r.log,
+		))
+
+		assert.Equal(t, []string{"seg retire", "db compact"}, mgr.ran)
+		assert.FileExists(t, filepath.Join(resultsDir, "seg-retire.log"))
+	})
+
+	t.Run("its failure fails the phase", func(t *testing.T) {
+		mgr := &fakeDBMaintenanceMgr{failCommand: "seg"}
+		r, resultsDir := dbCompactionTestRunner(t, mgr)
+
+		err := r.runDBCompactionContainers(
+			context.Background(), dbCompactionTestRequest(resultsDir),
+			cmds, steps, resultsDir, r.log,
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `preparation step "seg-retire"`)
+		assert.Equal(t, []string{"seg retire"}, mgr.ran, "the compaction must not run")
+	})
+}
+
+func TestDBCompactionPrepareReport(t *testing.T) {
+	assert.Nil(t, dbCompactionPrepareReport(nil))
+
+	got := dbCompactionPrepareReport([]client.DBMaintenanceStep{
+		{Name: "seg-retire", Args: []string{"seg", "retire"}},
+	})
+	assert.Equal(t, []dbCompactionStep{
+		{Name: "seg-retire", Command: []string{"seg", "retire"}},
+	}, got)
+}
+
+// TestLogDBCompactionSkip covers the two shapes of the skip line: an INFO that
+// says how the datadir was compacted, and a WARNING naming the settings this run
+// configured that are therefore not going to take effect.
+func TestLogDBCompactionSkip(t *testing.T) {
+	entry := &dbCompactionMarkerEntry{
+		Client:      "erigon",
+		Image:       "ethpandaops/erigon:main",
+		RunID:       "run-1",
+		CompletedAt: "2026-09-09T20:21:21Z",
+		Prepare:     []string{"seg-retire"},
+		ExtraArgs:   []string{"--cache=16384"},
+	}
+
+	capture := func(e *dbCompactionMarkerEntry, cfg *config.DBCompactionConfig) *logrus.Entry {
+		log := logrus.New()
+		log.SetOutput(io.Discard)
+
+		hook := &captureHook{}
+		log.AddHook(hook)
+
+		logDBCompactionSkip(logrus.NewEntry(log), e, cfg)
+
+		require.Len(t, hook.entries, 1)
+
+		return hook.entries[0]
+	}
+
+	t.Run("matching config reports how it ran", func(t *testing.T) {
+		got := capture(entry, &config.DBCompactionConfig{
+			Prepare:   []string{"seg-retire"},
+			ExtraArgs: []string{"--cache=16384"},
+		})
+
+		assert.Equal(t, logrus.InfoLevel, got.Level)
+		assert.Equal(t, "seg-retire", got.Data["prepare"])
+		assert.Equal(t, "--cache=16384", got.Data["extra_args"])
+		assert.Equal(t, "run-1", got.Data["run_id"])
+		assert.Equal(t, "ethpandaops/erigon:main", got.Data["image"])
+		assert.NotContains(t, got.Data, "changed")
+	})
+
+	t.Run("a changed prepare warns", func(t *testing.T) {
+		got := capture(entry, &config.DBCompactionConfig{
+			ExtraArgs: []string{"--cache=16384"},
+		})
+
+		assert.Equal(t, logrus.WarnLevel, got.Level)
+		assert.Equal(t, "prepare: seg-retire -> none", got.Data["changed"])
+		assert.Contains(t, got.Message, "do NOT take effect")
+	})
+
+	t.Run("changed extra_args warn", func(t *testing.T) {
+		got := capture(entry, &config.DBCompactionConfig{
+			Prepare:   []string{"seg-retire"},
+			ExtraArgs: []string{"--cache=32768"},
+		})
+
+		assert.Equal(t, logrus.WarnLevel, got.Level)
+		assert.Equal(t, "extra_args: --cache=16384 -> --cache=32768", got.Data["changed"])
+	})
+
+	t.Run("both changed are reported together", func(t *testing.T) {
+		got := capture(entry, &config.DBCompactionConfig{})
+
+		assert.Equal(t, logrus.WarnLevel, got.Level)
+		assert.Equal(
+			t,
+			"prepare: seg-retire -> none; extra_args: --cache=16384 -> none",
+			got.Data["changed"],
+		)
+	})
+
+	t.Run("a settings-only change does not warn", func(t *testing.T) {
+		// timeout, inspect, continue_on_error and friends govern the run, not
+		// the bytes, so they must not read as a stale datadir.
+		got := capture(entry, &config.DBCompactionConfig{
+			Prepare:         []string{"seg-retire"},
+			ExtraArgs:       []string{"--cache=16384"},
+			Timeout:         "9h",
+			ContinueOnError: true,
+		})
+
+		assert.Equal(t, logrus.InfoLevel, got.Level)
+	})
+
+	t.Run("an older marker with no settings reads as none", func(t *testing.T) {
+		got := capture(
+			&dbCompactionMarkerEntry{RunID: "run-0", CompletedAt: "2026-09-09T00:00:00Z"},
+			&config.DBCompactionConfig{},
+		)
+
+		assert.Equal(t, logrus.InfoLevel, got.Level)
+		assert.Equal(t, "none", got.Data["prepare"])
+		assert.Equal(t, "none", got.Data["extra_args"])
+	})
+}
+
+// captureHook collects the entries a logrus logger emits, so a test can assert
+// on the level and fields of a single log line.
+type captureHook struct {
+	entries []*logrus.Entry
+}
+
+func (h *captureHook) Levels() []logrus.Level {
+	return logrus.AllLevels
+}
+
+func (h *captureHook) Fire(e *logrus.Entry) error {
+	h.entries = append(h.entries, e)
+
+	return nil
+}
+
+func TestDBCompactionStepNames(t *testing.T) {
+	assert.Nil(t, dbCompactionStepNames(nil))
+	assert.Equal(t, []string{"a", "b"}, dbCompactionStepNames([]dbCompactionStep{
+		{Name: "a"}, {Name: "b"},
+	}))
+}
+
+// TestDBCompactionRequestImage pins what the report and the marker record: the
+// image that actually ran the compaction, which db_compaction.image overrides.
+// Recording the instance image there would name a build that never ran.
+func TestDBCompactionRequestImage(t *testing.T) {
+	req := &dbCompactionRequest{
+		ImageName: "ethpandaops/erigon:main",
+		Cfg:       &config.DBCompactionConfig{},
+	}
+	assert.Equal(t, "ethpandaops/erigon:main", req.image())
+
+	req.Cfg.Image = "erigontech/erigon:v3.7.0"
+	assert.Equal(t, "erigontech/erigon:v3.7.0", req.image())
+
+	req.Cfg = nil
+	assert.Equal(t, "ethpandaops/erigon:main", req.image())
+}
+
+// TestDBCompactionMarkerRecordsTheOverriddenImage is the same fact end to end:
+// the datadir marker names the image that compacted it.
+func TestDBCompactionMarkerRecordsTheOverriddenImage(t *testing.T) {
+	dir := t.TempDir()
+
+	r := &runner{log: logrus.New(), cfg: &Config{}}
+
+	req := &dbCompactionRequest{
+		Instance:  &config.ClientInstance{ID: "erigon", Client: "erigon"},
+		ImageName: "ethpandaops/erigon:main",
+		Cfg:       &config.DBCompactionConfig{Image: "erigontech/erigon:v3.7.0"},
+		Phase:     config.DBCompactionBeforePreRuns,
+		RunID:     "run-1",
+	}
+
+	r.writeDBCompactionMarker(
+		dir, req, &dbCompactionReport{Image: req.image()}, r.log,
+	)
+
+	marker := readDBCompactionMarker(dir)
+	require.NotNil(t, marker)
+
+	entry := marker.Phases[config.DBCompactionBeforePreRuns]
+	assert.Equal(t, "erigontech/erigon:v3.7.0", entry.Image)
 }

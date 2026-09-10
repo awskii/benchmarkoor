@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1392,7 +1393,7 @@ const (
 // the global one; it does not merge field by field.
 //
 // Only clients whose spec returns compaction commands support this. Today
-// that is geth alone.
+// that is geth and erigon.
 type DBCompactionConfig struct {
 	Enabled bool `yaml:"enabled" mapstructure:"enabled" json:"enabled"`
 
@@ -1410,6 +1411,19 @@ type DBCompactionConfig struct {
 	// Inspect runs the client database inspection before and after each
 	// compaction and writes both reports to the run results. Default: true.
 	Inspect *bool `yaml:"inspect,omitempty" mapstructure:"inspect" json:"inspect,omitempty"`
+
+	// Prepare names the client's optional preparation steps to run, in the
+	// order given, before each compaction. Empty runs none, which is the safe
+	// default: a step that reclaims more on one datadir can ruin another.
+	//
+	// Erigon offers "seg-retire" (`erigon seg retire`). Enable it for a datadir
+	// whose history spans whole steps, where it is what leaves free pages for
+	// the compaction. Do NOT enable it for a state-actor or otherwise synthetic
+	// snapshot: it prunes without freezing there and leaves a datadir erigon
+	// refuses to reopen.
+	//
+	// Validation lists the steps a client offers, with what each one needs.
+	Prepare []string `yaml:"prepare,omitempty" mapstructure:"prepare" json:"prepare,omitempty"`
 
 	// Timeout caps one phase's compaction work as a Go duration string: the
 	// compaction and both inspections around it. It applies per phase, not to
@@ -1573,6 +1587,16 @@ func (c *DBCompactionConfig) InspectEnabled() bool {
 	return *c.Inspect
 }
 
+// PrepareSteps returns the preparation steps to run before each compaction, in
+// the configured order. Nil means none, which is the default.
+func (c *DBCompactionConfig) PrepareSteps() []string {
+	if c == nil || len(c.Prepare) == 0 {
+		return nil
+	}
+
+	return c.Prepare
+}
+
 // SkipIfMarkedEnabled reports whether a phase the datadir marker already names
 // is skipped. Defaults to true when the compaction persists, since only a
 // persisted marker can describe the datadir in front of us.
@@ -1634,11 +1658,63 @@ type ResourceLimits struct {
 	CpusetCount   *int         `yaml:"cpuset_count,omitempty" mapstructure:"cpuset_count" json:"cpuset_count,omitempty"`
 	Cpuset        []int        `yaml:"cpuset,omitempty" mapstructure:"cpuset" json:"cpuset,omitempty"`
 	Memory        string       `yaml:"memory,omitempty" mapstructure:"memory" json:"memory,omitempty"`
-	SwapDisabled  bool         `yaml:"swap_disabled,omitempty" mapstructure:"swap_disabled" json:"swap_disabled,omitempty"`
+	SwapDisabled  *bool        `yaml:"swap_disabled,omitempty" mapstructure:"swap_disabled" json:"swap_disabled,omitempty"`
 	BlkioConfig   *BlkioConfig `yaml:"blkio_config,omitempty" mapstructure:"blkio_config" json:"blkio_config,omitempty"`
 	CPUFreq       string       `yaml:"cpu_freq,omitempty" mapstructure:"cpu_freq" json:"cpu_freq,omitempty"`
 	CPUTurboBoost *bool        `yaml:"cpu_turboboost,omitempty" mapstructure:"cpu_turboboost" json:"cpu_turboboost,omitempty"`
 	CPUGovernor   string       `yaml:"cpu_freq_governor,omitempty" mapstructure:"cpu_freq_governor" json:"cpu_freq_governor,omitempty"`
+}
+
+// Merge returns a copy of r with the set fields of override on top of it.
+// The merge is field by field, so an instance can change one limit and keep the
+// other global defaults. Both sides accept a nil value.
+func (r *ResourceLimits) Merge(override *ResourceLimits) *ResourceLimits {
+	if r == nil {
+		return override
+	}
+
+	if override == nil {
+		return r
+	}
+
+	merged := *r
+	merged.Cpuset = slices.Clone(r.Cpuset)
+
+	// cpuset_count and cpuset are mutually exclusive, so a CPU selection in the
+	// override replaces both fields of the base.
+	if override.CpusetCount != nil || len(override.Cpuset) > 0 {
+		merged.CpusetCount = override.CpusetCount
+		merged.Cpuset = slices.Clone(override.Cpuset)
+	}
+
+	if override.Memory != "" {
+		merged.Memory = override.Memory
+	}
+
+	if override.SwapDisabled != nil {
+		merged.SwapDisabled = override.SwapDisabled
+	}
+
+	if override.CPUFreq != "" {
+		merged.CPUFreq = override.CPUFreq
+	}
+
+	if override.CPUTurboBoost != nil {
+		merged.CPUTurboBoost = override.CPUTurboBoost
+	}
+
+	if override.CPUGovernor != "" {
+		merged.CPUGovernor = override.CPUGovernor
+	}
+
+	merged.BlkioConfig = r.BlkioConfig.Merge(override.BlkioConfig)
+
+	return &merged
+}
+
+// IsSwapDisabled reports if the limits disable swap.
+func (r *ResourceLimits) IsSwapDisabled() bool {
+	return r != nil && r.SwapDisabled != nil && *r.SwapDisabled
 }
 
 // BlkioConfig configures container block I/O limits.
@@ -1647,6 +1723,43 @@ type BlkioConfig struct {
 	DeviceReadIOps  []ThrottleDevice `yaml:"device_read_iops,omitempty" mapstructure:"device_read_iops" json:"device_read_iops,omitempty"`
 	DeviceWriteBps  []ThrottleDevice `yaml:"device_write_bps,omitempty" mapstructure:"device_write_bps" json:"device_write_bps,omitempty"`
 	DeviceWriteIOps []ThrottleDevice `yaml:"device_write_iops,omitempty" mapstructure:"device_write_iops" json:"device_write_iops,omitempty"`
+}
+
+// Merge returns a copy of b with the set device lists of override on top of it.
+// Each device list is replaced as a whole. Both sides accept a nil value.
+func (b *BlkioConfig) Merge(override *BlkioConfig) *BlkioConfig {
+	if b == nil {
+		return override
+	}
+
+	if override == nil {
+		return b
+	}
+
+	merged := &BlkioConfig{
+		DeviceReadBps:   slices.Clone(b.DeviceReadBps),
+		DeviceReadIOps:  slices.Clone(b.DeviceReadIOps),
+		DeviceWriteBps:  slices.Clone(b.DeviceWriteBps),
+		DeviceWriteIOps: slices.Clone(b.DeviceWriteIOps),
+	}
+
+	if len(override.DeviceReadBps) > 0 {
+		merged.DeviceReadBps = slices.Clone(override.DeviceReadBps)
+	}
+
+	if len(override.DeviceReadIOps) > 0 {
+		merged.DeviceReadIOps = slices.Clone(override.DeviceReadIOps)
+	}
+
+	if len(override.DeviceWriteBps) > 0 {
+		merged.DeviceWriteBps = slices.Clone(override.DeviceWriteBps)
+	}
+
+	if len(override.DeviceWriteIOps) > 0 {
+		merged.DeviceWriteIOps = slices.Clone(override.DeviceWriteIOps)
+	}
+
+	return merged
 }
 
 // ThrottleDevice defines a device throttle setting.
@@ -3221,14 +3334,11 @@ func (c *Config) GetCPUSysfsPath() string {
 }
 
 // GetResourceLimits returns the resource limits for an instance.
-// Instance-level limits take precedence over global defaults.
+// Instance-level limits merge over the global defaults field by field, so a
+// field that the instance does not set keeps the global value.
 // Returns nil if no limits are configured.
 func (c *Config) GetResourceLimits(instance *ClientInstance) *ResourceLimits {
-	if instance.ResourceLimits != nil {
-		return instance.ResourceLimits
-	}
-
-	return c.Runner.Client.Config.ResourceLimits
+	return c.Runner.Client.Config.ResourceLimits.Merge(instance.ResourceLimits)
 }
 
 // GetRetryNewPayloadsSyncingState returns the retry config for an instance.
@@ -4110,6 +4220,10 @@ func (c *Config) validateDBCompaction(opt ValidateOpts) error {
 			return err
 		}
 
+		if err := validateDBCompactionPrepare(instance.ID, instance.Client, cfg); err != nil {
+			return err
+		}
+
 		if cfg.Timeout != "" {
 			d, err := time.ParseDuration(cfg.Timeout)
 			if err != nil {
@@ -4199,6 +4313,60 @@ func validateDBCompactionPhases(id string, cfg *DBCompactionConfig) error {
 				id, phase,
 			)
 		}
+	}
+
+	return nil
+}
+
+// validateDBCompactionPrepare checks that every name in db_compaction.prepare
+// is a step the client actually offers, and reports the alternatives when it is
+// not. The message carries each step's trade-off, since choosing one wrongly can
+// leave a datadir the client cannot reopen.
+func validateDBCompactionPrepare(id, clientName string, cfg *DBCompactionConfig) error {
+	if len(cfg.Prepare) == 0 {
+		return nil
+	}
+
+	steps := client.DBMaintenancePrepareSteps(client.ClientType(clientName))
+
+	available := make(map[string]string, len(steps))
+	for _, step := range steps {
+		available[step.Name] = step.Why
+	}
+
+	seen := make(map[string]struct{}, len(cfg.Prepare))
+
+	for _, name := range cfg.Prepare {
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf(
+				"instance %q: duplicate db_compaction.prepare step %q", id, name,
+			)
+		}
+
+		seen[name] = struct{}{}
+
+		if _, ok := available[name]; ok {
+			continue
+		}
+
+		if len(steps) == 0 {
+			return fmt.Errorf(
+				"instance %q: db_compaction.prepare names %q, but client %q offers"+
+					" no preparation steps",
+				id, name, clientName,
+			)
+		}
+
+		offered := make([]string, 0, len(steps))
+		for _, step := range steps {
+			offered = append(offered, fmt.Sprintf("%q (%s)", step.Name, step.Why))
+		}
+
+		return fmt.Errorf(
+			"instance %q: unknown db_compaction.prepare step %q for client %q;"+
+				" available: %s",
+			id, name, clientName, strings.Join(offered, ", "),
+		)
 	}
 
 	return nil
