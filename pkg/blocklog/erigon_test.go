@@ -8,8 +8,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Taken verbatim from a validated block.
-const erigonPayload = `{"level":"warn","msg":"Slow block","block":{"number":1,"hash":"0xb8dadbee815351753287e128c38d4bde06d231afd5662739eede2e39dd08138e","gas_used":12000,"tx_count":1},"timing":{"execution_ms":0.854709,"state_read_ms":0.00125,"state_hash_ms":0.077708,"commit_ms":0.233458,"total_ms":1.165875},"throughput":{"mgas_per_sec":14.04},"state_reads":{"accounts":3,"storage_slots":0,"code":0},"state_writes":{"accounts":2,"storage_slots":1,"code":0},"cache":{"account":{"hits":3,"misses":0,"hit_rate":100},"storage":{"hits":0,"misses":0,"hit_rate":0},"code":{"hits":0,"misses":0,"hit_rate":0}}}`
+// Taken verbatim from a validated block that deploys a contract. Erigon omits
+// state_reads.code and cache.code rather than reporting zero, because it has no
+// CodeDomain read counter; state_writes.code is counted and so is emitted.
+// total_ms is end-to-end and exceeds execution_ms + state_hash_ms + commit_ms.
+const erigonPayload = `{"level":"warn","msg":"Slow block","block":{"number":2,"hash":"0xda4c162eb46b6163de6ab73a4a56d78c34e82771a875687868d4d006e8ac3b37","gas_used":185130,"tx_count":1},"timing":{"execution_ms":0.408167,"state_read_ms":0.001291,"state_hash_ms":0.06425,"commit_ms":0.179,"total_ms":0.744125},"throughput":{"mgas_per_sec":453.56},"state_reads":{"accounts":4,"storage_slots":0},"state_writes":{"accounts":3,"storage_slots":0,"code":1},"cache":{"account":{"hits":4,"misses":0,"hit_rate":100},"storage":{"hits":0,"misses":0,"hit_rate":0}}}`
 
 func erigonJSONLine(t *testing.T, payload string) string {
 	t.Helper()
@@ -40,31 +43,42 @@ func TestErigonParser_ParseLine(t *testing.T) {
 				assert.Equal(t, "Slow block", data["msg"])
 
 				block := data["block"].(map[string]any)
-				assert.Equal(t, float64(1), block["number"])
-				assert.Equal(t, "0xb8dadbee815351753287e128c38d4bde06d231afd5662739eede2e39dd08138e", block["hash"])
-				assert.Equal(t, float64(12000), block["gas_used"])
+				assert.Equal(t, float64(2), block["number"])
+				assert.Equal(t, "0xda4c162eb46b6163de6ab73a4a56d78c34e82771a875687868d4d006e8ac3b37", block["hash"])
+				assert.Equal(t, float64(185130), block["gas_used"])
 				assert.Equal(t, float64(1), block["tx_count"])
 
 				timing := data["timing"].(map[string]any)
-				assert.Equal(t, 0.854709, timing["execution_ms"])
-				assert.Equal(t, 0.00125, timing["state_read_ms"])
-				assert.Equal(t, 0.077708, timing["state_hash_ms"])
-				assert.Equal(t, 0.233458, timing["commit_ms"])
-				assert.Equal(t, 1.165875, timing["total_ms"])
+				assert.Equal(t, 0.408167, timing["execution_ms"])
+				assert.Equal(t, 0.001291, timing["state_read_ms"])
+				assert.Equal(t, 0.06425, timing["state_hash_ms"])
+				assert.Equal(t, 0.179, timing["commit_ms"])
+				assert.Equal(t, 0.744125, timing["total_ms"])
+
+				phases := timing["execution_ms"].(float64) + timing["state_hash_ms"].(float64) + timing["commit_ms"].(float64)
+				assert.Greater(t, timing["total_ms"].(float64)-phases, 0.01,
+					"total_ms is end-to-end, so it exceeds the phase breakdown by the stages outside it")
 
 				throughput := data["throughput"].(map[string]any)
-				assert.Equal(t, 14.04, throughput["mgas_per_sec"])
+				assert.Equal(t, 453.56, throughput["mgas_per_sec"])
 
 				stateReads := data["state_reads"].(map[string]any)
-				assert.Equal(t, float64(3), stateReads["accounts"])
+				assert.Equal(t, float64(4), stateReads["accounts"])
 				assert.Equal(t, float64(0), stateReads["storage_slots"])
-				assert.Equal(t, float64(0), stateReads["code"])
+				assert.NotContains(t, stateReads, "code",
+					"Erigon omits code reads rather than reporting an unmeasured zero")
 
 				stateWrites := data["state_writes"].(map[string]any)
-				assert.Equal(t, float64(2), stateWrites["accounts"])
+				assert.Equal(t, float64(3), stateWrites["accounts"])
+				assert.Equal(t, float64(1), stateWrites["code"],
+					"code writes are counted, so the deploy must survive the round trip")
 
-				account := data["cache"].(map[string]any)["account"].(map[string]any)
-				assert.Equal(t, float64(3), account["hits"])
+				cache := data["cache"].(map[string]any)
+				assert.NotContains(t, cache, "code",
+					"Erigon omits the code cache summary rather than reporting an unmeasured zero")
+
+				account := cache["account"].(map[string]any)
+				assert.Equal(t, float64(4), account["hits"])
 				assert.Equal(t, float64(0), account["misses"])
 				assert.Equal(t, float64(100), account["hit_rate"])
 			},
@@ -77,8 +91,8 @@ func TestErigonParser_ParseLine(t *testing.T) {
 				t.Helper()
 
 				assert.Equal(t, "Slow block", data["msg"])
-				assert.Equal(t, float64(1), data["block"].(map[string]any)["number"])
-				assert.Equal(t, 0.077708, data["timing"].(map[string]any)["state_hash_ms"])
+				assert.Equal(t, float64(2), data["block"].(map[string]any)["number"])
+				assert.Equal(t, 0.06425, data["timing"].(map[string]any)["state_hash_ms"])
 			},
 		},
 		{
@@ -119,8 +133,8 @@ func TestErigonParser_ParseLine(t *testing.T) {
 				t.Helper()
 
 				assert.Equal(t, "Slow block", data["msg"])
-				assert.Equal(t, float64(12000), data["block"].(map[string]any)["gas_used"])
-				assert.Equal(t, 1.165875, data["timing"].(map[string]any)["total_ms"])
+				assert.Equal(t, float64(185130), data["block"].(map[string]any)["gas_used"])
+				assert.Equal(t, 0.744125, data["timing"].(map[string]any)["total_ms"])
 			},
 		},
 		{
@@ -156,7 +170,7 @@ func TestErigonParser_ParseLine(t *testing.T) {
 				t.Helper()
 
 				assert.Equal(t, "Slow block", data["msg"])
-				assert.Equal(t, 1.165875, data["timing"].(map[string]any)["total_ms"])
+				assert.Equal(t, 0.744125, data["timing"].(map[string]any)["total_ms"])
 			},
 		},
 		{
