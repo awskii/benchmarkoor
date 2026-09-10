@@ -24,7 +24,7 @@ This feature correlates these metrics with specific benchmark tests using block 
 This feature implements the unified "slowblock" metrics specification developed across Ethereum execution clients. The specification standardizes how clients report detailed block execution metrics.
 
 For more details on the specification and motivation, see:
-- [ethresear.ch: Unified slowblock metrics specification](https://ethresear.ch/t/unifying-execution-layer-execution-metrics/22089)
+- [ethresear.ch: Unified slowblock metrics specification](https://ethresear.ch/t/a-small-step-towards-data-driven-protocol-decisions-unified-slowblock-metrics-across-clients/23907)
 
 ### Client Implementation PRs
 
@@ -88,8 +88,18 @@ default of `-1ns` disables the feature. Setting it also switches on Erigon's
 per-domain read counters, so no separate environment variable is needed.
 
 Without the flag no record is emitted at all. With it, every documented field is
-captured except `state_reads.code_bytes` and `state_writes.code_bytes`, which
-Erigon has no per-block source for and omits rather than reporting as zero.
+captured except four, which Erigon has no per-block source for and omits rather
+than reporting as zero: `state_reads.code`, `state_reads.code_bytes`,
+`state_writes.code_bytes` and the whole `cache.code` object. `state_writes.code`
+is counted and is emitted.
+
+Two Erigon values do not mean quite what the tables above say. `total_ms` is
+measured end-to-end and covers the header, body and sender stages that sit
+outside the phase breakdown, so it exceeds `execution_ms + state_hash_ms +
+commit_ms` rather than balancing against it. `state_read_ms` sums each execution
+worker's own accumulator, so under the parallel executor it is CPU time across
+workers and can exceed the wall-clock `execution_ms`; do not subtract it from
+`execution_ms`.
 
 Every envelope Erigon can produce is parsed: the default console line, the
 colourised form it uses on a TTY, the timestamp-less form under
