@@ -41,10 +41,11 @@ For more details on the specification and motivation, see:
 | Client | Parser Status |
 |--------|---------------|
 | Geth | Fully supported |
-| Reth | Stub (pending) |
-| Besu | Stub (pending) |
-| Nethermind | Stub (pending) |
+| Reth | Fully supported |
+| Besu | Fully supported |
+| Nethermind | Fully supported |
 | Erigon | Fully supported |
+| Ethrex | Fully supported |
 | Nimbus | Stub (pending) |
 
 The parsing infrastructure (`pkg/blocklog`) supports all clients via the `Parser` interface. Parsers marked as stubs return no matches until their specific log formats are implemented.
@@ -69,15 +70,18 @@ The `--debug.logslowblock=0` flag sets the threshold to 0 milliseconds, meaning 
 
 ### Erigon
 
-Requires an Erigon build that carries the slow block record (see the PR in the
-table above); earlier releases reject the flag and the container will not start.
+`--debug.slow-block-threshold` is not in any published Erigon image yet. It
+arrives with the PR in the table above, and a build without it rejects the
+unknown flag, so the container exits at startup. Until that merges, point
+`image` at a build of the PR head — `erigontech/erigon:main-latest` and the
+default `erigontech/erigon:latest` are both too old.
 
 ```yaml
 runner:
   instances:
     - id: erigon
       client: erigon
-      image: erigontech/erigon:main-latest
+      image: <a build carrying erigontech/erigon#23764>
       extra_args:
         - --debug.slow-block-threshold=0
 ```
@@ -88,8 +92,9 @@ default of `-1ns` disables the feature. Setting it also switches on Erigon's
 per-domain read counters, so no separate environment variable is needed.
 
 Without the flag no record is emitted at all. With it, every documented field is
-captured except four, which Erigon has no per-block source for and omits rather
+captured except six, which Erigon has no per-block source for and omits rather
 than reporting as zero: `state_reads.code`, `state_reads.code_bytes`,
+`state_writes.accounts_deleted`, `state_writes.storage_slots_deleted`,
 `state_writes.code_bytes` and the whole `cache.code` object. `state_writes.code`
 is counted and is emitted.
 
