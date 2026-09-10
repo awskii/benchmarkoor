@@ -70,18 +70,18 @@ The `--debug.logslowblock=0` flag sets the threshold to 0 milliseconds, meaning 
 
 ### Erigon
 
-`--debug.slow-block-threshold` is not in any published Erigon image yet. It
-arrives with the PR in the table above, and a build without it rejects the
-unknown flag, so the container exits at startup. Until that merges, point
-`image` at a build of the PR head — `erigontech/erigon:main-latest` and the
-default `erigontech/erigon:latest` are both too old.
+`--debug.slow-block-threshold` landed in the PR in the table above, so
+`erigontech/erigon:main-latest` carries it from the first image built after that
+merge. The release tag `erigontech/erigon:latest` will not until the next
+release, and a build without the flag rejects it as unknown, so the container
+exits at startup rather than ignoring it.
 
 ```yaml
 runner:
   instances:
     - id: erigon
       client: erigon
-      image: <a build carrying erigontech/erigon#23764>
+      image: erigontech/erigon:main-latest
       extra_args:
         - --debug.slow-block-threshold=0
 ```
@@ -113,7 +113,8 @@ inside the log entry's own `msg` field.
 
 ### Other Clients
 
-Configuration flags for other clients will be documented as their parsers are implemented.
+Reth, Besu, Nethermind and Ethrex have parsers, but the flag that makes each of
+them emit the record is not documented here yet.
 
 ## Metrics Captured
 
