@@ -307,9 +307,9 @@ export function BlockLogDetails({ blockLog, threshold = DEFAULT_THRESHOLD, slowM
   const stateOpsOption = useMemo(() => {
     if (!hasStateOps) return null
     const categories = ['Accounts', 'Storage', 'Code']
-    const reads = [state_reads.accounts, state_reads.storage_slots, state_reads.code ?? 0]
-    const writes = [state_writes.accounts, state_writes.storage_slots, state_writes.code ?? 0]
-    const deleted = [state_writes.accounts_deleted ?? 0, state_writes.storage_slots_deleted ?? 0, 0]
+    const reads = [state_reads.accounts, state_reads.storage_slots, state_reads.code ?? null]
+    const writes = [state_writes.accounts, state_writes.storage_slots, state_writes.code ?? null]
+    const deleted = [state_writes.accounts_deleted ?? null, state_writes.storage_slots_deleted ?? null, 0]
 
     return {
       tooltip: {

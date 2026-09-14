@@ -6,6 +6,7 @@ import type { SuiteTest, AggregatedStats, BlockLogs, BlockLogEntry } from '@/api
 import { type StepTypeOption, getAggregatedStats } from '@/pages/RunDetailPage'
 import { Pagination } from '@/components/shared/Pagination'
 import { TestName } from '@/components/shared/TestName'
+import { compareOptional } from '@/components/run-detail/block-logs-dashboard/hooks/useProcessedData'
 import { type CompareRun, type LabelMode, RUN_SLOTS, formatRunLabel } from './constants'
 
 interface TestComparisonTableProps {
@@ -261,7 +262,7 @@ export function TestComparisonTable({ runs, suiteTests, stepFilter, blockLogsPer
             cmp = (a.gasUsed ?? 0) - (b.gasUsed ?? 0)
             break
           case 'avgValue':
-            cmp = (a.avgValue ?? 0) - (b.avgValue ?? 0)
+            cmp = compareOptional(a.avgValue, b.avgValue)
             break
         }
       }
