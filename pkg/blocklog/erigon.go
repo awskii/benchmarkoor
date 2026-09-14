@@ -2,17 +2,9 @@ package blocklog
 
 import (
 	"encoding/json"
-	"regexp"
+	"strings"
 
 	"github.com/ethpandaops/benchmarkoor/pkg/client"
-)
-
-// erigonLogPattern matches the console form (after ANSI stripping): an
-// optionally bracketed level, an optional bracketed timestamp, then the JSON
-// payload. Requiring a token before the brace is what routes --log.json lines
-// to erigonJSONPayload instead.
-var erigonLogPattern = regexp.MustCompile(
-	`^\[?\w+\s*\]?\s*(?:\[[^\]]+\]\s*)?(\{.+\})\s*$`,
 )
 
 // erigonParser parses JSON payloads from Erigon client slow block logs.
@@ -44,12 +36,12 @@ func (p *erigonParser) ParseLine(line string) (json.RawMessage, bool) {
 }
 
 func erigonConsolePayload(line string) (string, bool) {
-	matches := erigonLogPattern.FindStringSubmatch(line)
-	if len(matches) < 2 {
+	i := strings.IndexByte(line, '{')
+	if i <= 0 {
 		return "", false
 	}
 
-	return matches[1], true
+	return line[i:], true
 }
 
 // erigonJSONPayload unwraps the record from --log.json output, where the whole
