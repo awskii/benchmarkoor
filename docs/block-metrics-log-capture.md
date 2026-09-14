@@ -98,13 +98,13 @@ than reporting as zero: `state_reads.code`, `state_reads.code_bytes`,
 `state_writes.code_bytes` and the whole `cache.code` object. `state_writes.code`
 is counted and is emitted.
 
-Two Erigon values do not mean quite what the tables above say. `total_ms` is
-measured end-to-end and covers the header, body and sender stages that sit
-outside the phase breakdown, so it exceeds `execution_ms + state_hash_ms +
-commit_ms` rather than balancing against it. `state_read_ms` sums each execution
-worker's own accumulator, so under the parallel executor it is CPU time across
-workers and can exceed the wall-clock `execution_ms`; do not subtract it from
-`execution_ms`.
+Two Erigon values do not mean quite what the Timing Breakdown table below says.
+`total_ms` is measured end-to-end and covers the header, body and sender stages
+that sit outside the phase breakdown, so it exceeds `execution_ms +
+state_hash_ms + commit_ms` rather than balancing against it. `state_read_ms`
+sums each execution worker's own accumulator, so under the parallel executor it
+is CPU time across workers and can exceed the wall-clock `execution_ms`; do not
+subtract it from `execution_ms`.
 
 Every envelope Erigon can produce is parsed: the default console line, the
 colourised form it uses on a TTY, the timestamp-less form under
